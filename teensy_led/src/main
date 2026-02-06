@@ -89,7 +89,7 @@ int rxIndex = 0;
 float bandAmplitude[MAX_BANDS] = {0};
 float beatAmplitude = 0.0f;
 uint8_t spdifLock = 0;
-int currentBandCount = BANDS_10;  // Default to 10 bands
+int currentBandCount = BANDS_12;  // Default to 12 bands
 
 // Chroma/pitch data (for future use)
 uint8_t chroma[12] = {0};        // Pitch class energies: C, C#, D, D#, E, F, F#, G, G#, A, A#, B
@@ -97,10 +97,10 @@ uint8_t dominantPitch = 255;     // 0-11 = pitch class, 255 = none
 uint8_t pitchStrength = 0;       // 0-255
 uint8_t pitchReserved = 0;       // reserved
 
-// Returns band count for Music mode pattern: 0-5 = 12 bands, 6-11 = 10 bands
+// Returns band count for Music mode pattern (always 12 bands)
 int getBandCountForPattern(int pattern) {
-    // Patterns 0-6 use 12 bands, patterns 7+ use 10 bands
-    return (pattern >= 0 && pattern <= 6) ? BANDS_12 : BANDS_10;
+    (void)pattern;
+    return BANDS_12;
 }
 
 // Display settings
@@ -907,7 +907,7 @@ static void renderEQFire(bool useBeatStrips) {
 
 static void renderMusicVisualization() {
     int bands = currentBandCount;
-    bool useBeatStrips = (bands == BANDS_10);
+    bool useBeatStrips = false;
     int viz = state.pattern;
 
     switch (viz) {

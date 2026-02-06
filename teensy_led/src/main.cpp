@@ -402,7 +402,7 @@ void processSerialData() {
                     continue;
                 }
 
-                if (rxIndex >= expectedFrameSize) {
+                if ((size_t)rxIndex >= expectedFrameSize) {
                     // Complete frame received
                     // uint8_t frameSeq = rxBuffer[2];  // Available if needed
                     uint8_t* payload = &rxBuffer[4];

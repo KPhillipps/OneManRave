@@ -12,17 +12,16 @@ void mapAmplitudesToLEDs();
 
 // Individual visualizations (pattern index in Music mode)
 // 0-6: EQ-style visualizations (rendered via renderMusicVisualization())
-// 7: Harmonic Aurora
 // 8: Fire2012 with audio enhancement
-// 9: Vocal Aurora
 // 10: Meteorite Rain
 // 11: Red Comet with Audio
 
 void Fire2012WithAudioEnhanced();
 void RedCometWithAudio1();
 void meteoriteRain(bool reset = false);
-void vocalAurora(bool reset = false);
-void harmonicAurora(bool reset = false);
+void AuroraOrganic_Run(bool reset = false);
+void AuroraNoteSparks_Run(bool reset = false);
+void setAuroraNote(uint8_t note, uint8_t velocity);   // optional, if FFT packets include a note
 
 // Fire tuning parameters (persisted to EEPROM in main.cpp)
 void setFireParams(float boost, uint8_t cooling, uint8_t sparking);

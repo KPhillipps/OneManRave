@@ -5,7 +5,7 @@ namespace Proto {
 static const uint8_t TYPE_FFT = 0x01;
 static const uint8_t TYPE_CMD = 0x02;
 
-static const uint8_t FFT_PAYLOAD_LEN = 68;  // 12 floats + vocal + spdif + chroma + pitch + reserved
+static const uint8_t FFT_PAYLOAD_LEN = 68;  // 12 floats + vocal + spdif + hpsPitchClass[12] + pitch + strength + sustain
 static const uint8_t CMD_PAYLOAD_LEN = FFT_PAYLOAD_LEN;   // Fixed-length frames for both FFT and CMD
 
 inline uint16_t crc16_ccitt(const uint8_t* data, size_t len) {

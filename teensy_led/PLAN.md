@@ -121,7 +121,7 @@ Pattern selection in Music mode:
 - 5: EQ Bars Mono
 - **6: EQ Fire (NEW)** ← frequency-reactive fire
 
-Uses 10 bands (same as patterns 6-11), so beat strips on 0 and 11.
+Uses 12 bands.
 
 ## Testing Checklist
 - [ ] Fire looks realistic (smooth flames, proper colors)

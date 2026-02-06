@@ -44,7 +44,7 @@ AudioAnalyzeFFT1024 fftRight;
 AudioConnection patchCordLeft(spdifInput, 0, fftLeft, 0);   // Channel 0 (Left)
 AudioConnection patchCordRight(spdifInput, 1, fftRight, 0); // Channel 1 (Right)
 
-// FFT band grouping - 12 bands (patterns 0-5)
+// FFT band grouping - 12 bands (always)
 // More resolution in mids, band 11 is 8.5-20kHz
 const int BANDS_12 = 12;
 const int binGroups12[12][2] = {
@@ -62,19 +62,9 @@ const int binGroups12[12][2] = {
     {197, 464}    // 8.5-20k     Air
 };
 
-// FFT band grouping - 10 bands (patterns 6+)
-const int BANDS_10 = 10;
-const int binGroups10[10][2] = {
-    {1, 1}, {2, 2}, {3, 4}, {5, 7}, {8, 15},
-    {16, 29}, {30, 58}, {59, 116}, {117, 232}, {233, 464}
-};
-
 // Maximum bands (for array sizing)
 const int MAX_BANDS = 12;
 
-// Current band configuration
-int activeBands = 12;  // Default to 12 bands
-int currentPattern = 0;
 
 // Display settings
 const float smoothingFactor = 0.15;
@@ -82,9 +72,6 @@ const float FFT_CAL_GAIN = 8000.0f;
 const float bandTilt12[BANDS_12] = {
     1.0f, 1.0f, 1.05f, 1.1f, 1.15f, 1.2f,
     1.3f, 1.4f, 1.5f, 1.7f, 1.85f, 2.0f};
-const float bandTilt10[BANDS_10] = {
-    1.0f, 1.0f, 1.05f, 1.1f, 1.2f,
-    1.3f, 1.4f, 1.6f, 1.8f, 2.0f};
 
 // FFT bin frequency (Hz per bin at 44.1k / 1024)
 const float BIN_FREQ_HZ = 44100.0f / 1024.0f;
@@ -131,22 +118,29 @@ static AudioAnalyzeFFT1024* activeFft = &fftLeft;
 static const char* activeChannelLabel = "LEFT (ch0)";
 
 // ============================================================================
-// PITCH DETECTION - Chroma extraction for dominant pitch and harmonic fingerprint
+// PITCH DETECTION - Harmonic Product Spectrum (HPS) for vocal pitch
 // ============================================================================
 // Pitch classes: 0=C, 1=C#, 2=D, 3=D#, 4=E, 5=F, 6=F#, 7=G, 8=G#, 9=A, 10=A#, 11=B
 
 const int NUM_PITCH_CLASSES = 12;
 const char* pitchNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
 
-// Chroma state
-float chromaRaw[NUM_PITCH_CLASSES] = {0};      // Raw chroma from current FFT
-float chromaSmoothed[NUM_PITCH_CLASSES] = {0}; // Smoothed chroma for stability
-const float chromaSmoothFactor = 0.3f;         // Higher = more smoothing
+// HPS configuration
+const int HPS_BIN_START = 4;    // ~172 Hz (skip sub-bass dominated by instruments)
+const int HPS_BIN_END = 25;     // ~1.1 kHz (high vocal fundamental)
+const int HPS_HARMONICS = 4;    // Multiply fundamental * 2x * 3x * 4x
+const float HPS_MIN_PEAK = 0.00001f;       // Minimum HPS product to consider valid
+const float HPS_PEAK_RATIO_THRESH = 1.8f;  // Peak must be this × the average HPS
+const float HPS_SMOOTH_FACTOR = 0.4f;      // Smooth HPS across frames (higher = more smoothing)
+
+// HPS state
+float hpsSmoothed[HPS_BIN_END + 1];         // Smoothed HPS per bin (init in setup)
+float hpsPitchClass[NUM_PITCH_CLASSES];     // HPS energy per pitch class (init in setup)
 
 // Pitch detection output
-uint8_t chromaOut[NUM_PITCH_CLASSES];  // Quantized chroma (0-255) for transmission
 uint8_t dominantPitch = 255;           // 0-11 = pitch class, 255 = none
-uint8_t dominantPitchStrength = 0;     // Strength of dominant pitch (0-255)
+uint8_t dominantPitchStrength = 0;     // Confidence of dominant pitch (0-255)
+uint16_t dominantPitchHz = 0;          // Detected fundamental frequency in Hz
 
 // ============================================================================
 // VOCAL ENVELOPE + SYLLABLE DETECTION (vocal-focused energy + transient gating)
@@ -183,25 +177,19 @@ static uint8_t vocalSustain = 0;
 static uint8_t sustainCandidate = 255;
 static uint8_t sustainStableCount = 0;
 
-// Precomputed bin-to-pitch-class mapping
-// FFT1024 @ 44.1kHz: bin_freq = bin * 43.07Hz
-// We use bins 2-120 (~86Hz to ~5.2kHz) for harmonic content
-const int CHROMA_BIN_START = 2;
-const int CHROMA_BIN_END = 120;
-int8_t binToPitchClass[CHROMA_BIN_END + 1];  // -1 = not used
+// Precomputed bin-to-pitch-class lookup (for fundamental range only)
+int8_t binToPitchClass[HPS_BIN_END + 1];
 
-// Initialize bin-to-pitch-class lookup table
-void initChromaMapping() {
+void initPitchMapping() {
     const float binFreqHz = 44100.0f / 1024.0f;  // ~43.07 Hz per bin
-    const float C0 = 16.3516f;  // C0 frequency
+    const float C0 = 16.3516f;
 
-    for (int bin = 0; bin <= CHROMA_BIN_END; bin++) {
-        if (bin < CHROMA_BIN_START) {
+    for (int bin = 0; bin <= HPS_BIN_END; bin++) {
+        if (bin < HPS_BIN_START) {
             binToPitchClass[bin] = -1;
             continue;
         }
         float freq = bin * binFreqHz;
-        // Calculate pitch class: 12 * log2(freq / C0) mod 12
         float semitones = 12.0f * log2f(freq / C0);
         int pitchClass = ((int)roundf(semitones)) % 12;
         if (pitchClass < 0) pitchClass += 12;
@@ -209,56 +197,125 @@ void initChromaMapping() {
     }
 }
 
-// Extract chroma from FFT bins and find dominant pitch
-void calculateChroma() {
-    // Clear raw chroma
-    for (int i = 0; i < NUM_PITCH_CLASSES; i++) {
-        chromaRaw[i] = 0.0f;
+// Harmonic Product Spectrum: geometric mean of fundamental × harmonics
+// geomean = (mag[b] * mag[2b] * mag[3b] * mag[4b])^(1/4)
+// Values stay in the same range as raw FFT magnitudes — no scaling needed.
+void calculatePitch() {
+    float hpsRaw[HPS_BIN_END + 1] = {0};
+    int maxBin = 511;
+
+    for (int bin = HPS_BIN_START; bin <= HPS_BIN_END; bin++) {
+        float mag = activeFft->read(bin);
+        if (mag < 1e-8f) continue;
+        float product = mag;
+        bool valid = true;
+        for (int h = 2; h <= HPS_HARMONICS; h++) {
+            int harmBin = bin * h;
+            if (harmBin > maxBin) { valid = false; break; }
+            float hMag = activeFft->read(harmBin);
+            if (hMag < 1e-8f) { valid = false; break; }
+            product *= hMag;
+        }
+        // 4th root (geometric mean of 4 values) keeps result in magnitude range
+        hpsRaw[bin] = valid ? powf(product, 0.25f) : 0.0f;
     }
 
-    // Accumulate energy into pitch classes
-    for (int bin = CHROMA_BIN_START; bin <= CHROMA_BIN_END; bin++) {
-        int pc = binToPitchClass[bin];
-        if (pc >= 0 && pc < NUM_PITCH_CLASSES) {
-            float mag = activeFft->read(bin);
-            chromaRaw[pc] += mag * mag;  // Use power for better discrimination
+    // Smooth across frames
+    for (int bin = HPS_BIN_START; bin <= HPS_BIN_END; bin++) {
+        hpsSmoothed[bin] = HPS_SMOOTH_FACTOR * hpsSmoothed[bin] +
+                          (1.0f - HPS_SMOOTH_FACTOR) * hpsRaw[bin];
+    }
+
+    // Find peak and average
+    int peakBin = HPS_BIN_START;
+    float peakVal = 0.0f;
+    float totalHps = 0.0f;
+    int binCount = HPS_BIN_END - HPS_BIN_START + 1;
+
+    for (int bin = HPS_BIN_START; bin <= HPS_BIN_END; bin++) {
+        totalHps += hpsSmoothed[bin];
+        if (hpsSmoothed[bin] > peakVal) {
+            peakVal = hpsSmoothed[bin];
+            peakBin = bin;
         }
     }
 
-    // Apply sqrt for perceptual scaling and smooth
-    float maxChroma = 0.0f;
-    float totalChroma = 0.0f;
-    for (int i = 0; i < NUM_PITCH_CLASSES; i++) {
-        chromaRaw[i] = sqrtf(chromaRaw[i]);
-        chromaSmoothed[i] = chromaSmoothFactor * chromaSmoothed[i] +
-                           (1.0f - chromaSmoothFactor) * chromaRaw[i];
-        totalChroma += chromaSmoothed[i];
-        if (chromaSmoothed[i] > maxChroma) maxChroma = chromaSmoothed[i];
+    float avgHps = totalHps / binCount;
+    float peakRatio = (avgHps > 1e-7f) ? (peakVal / avgHps) : 0.0f;
+
+    // Debug every frame — scan full FFT for peak magnitude
+    if (Serial) {
+        float fftPeakMag = 0.0f;
+        int fftPeakBin = 0;
+        for (int b = 1; b <= 511; b++) {
+            float m = activeFft->read(b);
+            if (m > fftPeakMag) { fftPeakMag = m; fftPeakBin = b; }
+        }
+        Serial.print("[HPS] fftPk=");
+        Serial.print(fftPeakMag, 4);
+        Serial.print("@");
+        Serial.print(fftPeakBin);
+        Serial.print("(");
+        Serial.print((int)(fftPeakBin * 43.07f));
+        Serial.print("Hz) hpsPk=");
+        Serial.print(peakVal, 5);
+        Serial.print(" avg=");
+        Serial.print(avgHps, 5);
+        Serial.print(" ratio=");
+        Serial.print(peakRatio, 1);
+        Serial.print(" hpsBin=");
+        Serial.print(peakBin);
+        Serial.print(" env=");
+        Serial.print(vocalEnvSmoothed, 2);
+        Serial.println();
     }
 
-    // Normalize and quantize to 0-255
-    for (int i = 0; i < NUM_PITCH_CLASSES; i++) {
-        float normalized = (maxChroma > 0.001f) ? (chromaSmoothed[i] / maxChroma) : 0.0f;
-        chromaOut[i] = (uint8_t)(normalized * 255.0f);
-    }
+    // Gate: only report when vocal envelope is active and peak stands out
+    bool pitchValid = (peakVal > 1e-5f && peakRatio > HPS_PEAK_RATIO_THRESH &&
+                       vocalEnvSmoothed > 0.05f);
 
-    // Find dominant pitch class with confidence
-    int maxIdx = 0;
-    for (int i = 1; i < NUM_PITCH_CLASSES; i++) {
-        if (chromaOut[i] > chromaOut[maxIdx]) maxIdx = i;
-    }
+    if (pitchValid) {
+        float refinedBin = (float)peakBin;
+        if (peakBin > HPS_BIN_START && peakBin < HPS_BIN_END) {
+            float alpha = hpsSmoothed[peakBin - 1];
+            float beta  = hpsSmoothed[peakBin];
+            float gamma = hpsSmoothed[peakBin + 1];
+            float denom = alpha - 2.0f * beta + gamma;
+            if (fabsf(denom) > 1.0e-12f) {
+                refinedBin += 0.5f * (alpha - gamma) / denom;
+            }
+        }
 
-    // Calculate how dominant the peak is vs average (confidence measure)
-    float avgChroma = totalChroma / 12.0f;
-    float peakRatio = (avgChroma > 0.001f) ? (chromaSmoothed[maxIdx] / avgChroma) : 0.0f;
-
-    // Dominant pitch needs to be significantly above average (ratio > 1.5)
-    if (chromaOut[maxIdx] > 30 && peakRatio > 1.5f) {
-        dominantPitch = maxIdx;
-        dominantPitchStrength = min(255, (int)((peakRatio - 1.0f) * 100.0f));
+        float freqHz = refinedBin * (44100.0f / 1024.0f);
+        dominantPitchHz = (uint16_t)(freqHz + 0.5f);
+        dominantPitch = binToPitchClass[peakBin];
+        dominantPitchStrength = min(255, (int)((peakRatio - 1.0f) * 50.0f));
     } else {
         dominantPitch = 255;
         dominantPitchStrength = 0;
+        dominantPitchHz = 0;
+    }
+
+    if (Serial) {
+        Serial.print("[NOTE] ");
+        if (dominantPitch < 12) {
+            Serial.print(pitchNames[dominantPitch]);
+            Serial.print(dominantPitchHz);
+            Serial.print("Hz ");
+            Serial.print(dominantPitchStrength);
+        } else {
+            Serial.print("--");
+        }
+        Serial.println();
+    }
+
+    // Accumulate HPS energy per pitch class (for LED payload)
+    for (int i = 0; i < NUM_PITCH_CLASSES; i++) hpsPitchClass[i] = 0.0f;
+    for (int bin = HPS_BIN_START; bin <= HPS_BIN_END; bin++) {
+        int pc = binToPitchClass[bin];
+        if (pc >= 0 && pc < NUM_PITCH_CLASSES && hpsSmoothed[bin] > hpsPitchClass[pc]) {
+            hpsPitchClass[pc] = hpsSmoothed[bin];
+        }
     }
 }
 
@@ -322,20 +379,6 @@ void calculateVocalEnvelope() {
         lastSyllableNote = vocalNoteOut;
         lastSyllableStrength = vocalNoteStrengthOut;
 
-        if (Serial) {
-            Serial.print("[Vocal] syllable env=");
-            Serial.print(vocalEnvOut);
-            Serial.print(" note=");
-            if (vocalNoteOut < 12) {
-                Serial.print(pitchNames[vocalNoteOut]);
-                Serial.print("(");
-                Serial.print(vocalNoteStrengthOut);
-                Serial.print(")");
-            } else {
-                Serial.print("--");
-            }
-            Serial.println();
-        }
     } else if (vocalNoteCaptureRemaining > 0) {
         if (curPitch < 12) {
             vocalNoteOut = curPitch;
@@ -343,13 +386,6 @@ void calculateVocalEnvelope() {
             lastSyllableNote = vocalNoteOut;
             lastSyllableStrength = vocalNoteStrengthOut;
             vocalNoteCaptureRemaining = 0;
-            if (Serial) {
-                Serial.print("[Vocal] late note=");
-                Serial.print(pitchNames[vocalNoteOut]);
-                Serial.print("(");
-                Serial.print(vocalNoteStrengthOut);
-                Serial.println(")");
-            }
         } else {
             vocalNoteCaptureRemaining--;
         }
@@ -413,6 +449,7 @@ static void calculatePeakData() {
     if (peakNorm < 0.0f) peakNorm = 0.0f;
     if (peakNorm > 1.0f) peakNorm = 1.0f;
     majorPeakMag = (uint8_t)(peakNorm * 255.0f + 0.5f);
+
 }
 
 static void calculateVisualBands() {
@@ -468,7 +505,7 @@ static void calculateVisualBands() {
 }
 
 // Communication protocol (fixed 68-byte payload for all frames)
-// Layout: 12 floats (48) + vocal bytes (4) + spdif (1) + chroma[12] + dominantPitch + pitchStrength + sustain
+// Layout: 12 floats (48) + vocal bytes (4) + spdif (1) + hpsPitchClass[12] + dominantPitch + pitchStrength + dominantPitchHz(u16) + sustain
 namespace Proto {
 static const uint8_t SOF = 0xAA;
 static const uint8_t EOF_BYTE = 0xBB;
@@ -545,20 +582,11 @@ void calculateBandAmplitudes() {
         fftFrameSeenSinceStatus = true;
 
         // Calculate band amplitudes
-        for (int band = 0; band < activeBands; band++) {
+        for (int band = 0; band < BANDS_12; band++) {
             float sumEnergy = 0.0f;
-            int binStart, binEnd;
-            float tilt;
-
-            if (activeBands == 12) {
-                binStart = binGroups12[band][0];
-                binEnd = binGroups12[band][1];
-                tilt = bandTilt12[band];
-            } else {
-                binStart = binGroups10[band][0];
-                binEnd = binGroups10[band][1];
-                tilt = bandTilt10[band];
-            }
+            int binStart = binGroups12[band][0];
+            int binEnd = binGroups12[band][1];
+            float tilt = bandTilt12[band];
 
             int binCount = binEnd - binStart + 1;
 
@@ -577,8 +605,8 @@ void calculateBandAmplitudes() {
                                           ((1 - smoothingFactor) * calibratedEnergy);
         }
 
-        // Calculate chroma and dominant pitch
-        calculateChroma();
+        // Calculate pitch via Harmonic Product Spectrum
+        calculatePitch();
 
         // Calculate vocal envelope and syllable trigger
         calculateVocalEnvelope();
@@ -601,7 +629,7 @@ static void sendAuxFrame();
 
 void sendFftFrame() {
     bool hasSignal = false;
-    for (int i = 0; i < activeBands; i++) {
+    for (int i = 0; i < BANDS_12; i++) {
         if (smoothedBandAmplitude[i] > 0.00000001f) {
             hasSignal = true;
             break;
@@ -625,13 +653,13 @@ void sendFftFrame() {
     //         [48]=vocalEnv (0-255), [49]=syllableHit (0/1)
     //         [50]=vocalNote (0-11, 255=none), [51]=vocalNoteStrength (0-255)
     // [52]    spdif lock
-    // [53-64] chroma[12]: pitch class energies (0-255 each)
-    // [65]    dominantPitch (0-11 = pitch class, 255 = none)
-    // [66]    dominantPitchStrength (0-255)
+    // [53-64] hpsPitchClass[12]: HPS energy per pitch class (0-255 each)
+    // [65]    dominantPitch (0-11 = pitch class, 255 = none)  [HPS]
+    // [66]    dominantPitchStrength (0-255)                   [HPS confidence]
     // [67]    vocalSustain (0/1)
     uint8_t payload[Proto::PAYLOAD_LEN] = {0};
     float bands12[BANDS_12] = {0.0f};
-    for (int i = 0; i < activeBands && i < BANDS_12; i++) {
+    for (int i = 0; i < BANDS_12; i++) {
         bands12[i] = smoothedBandAmplitude[i];
     }
 
@@ -642,8 +670,15 @@ void sendFftFrame() {
     payload[51] = vocalNoteStrengthOut;
     payload[52] = spdifInput.pllLocked() ? 1 : 0;
 
-    // Add pitch detection data
-    memcpy(&payload[53], chromaOut, NUM_PITCH_CLASSES);
+    // Add HPS pitch detection data (normalize to 0-255)
+    float maxHpc = 0.0f;
+    for (int i = 0; i < NUM_PITCH_CLASSES; i++) {
+        if (hpsPitchClass[i] > maxHpc) maxHpc = hpsPitchClass[i];
+    }
+    for (int i = 0; i < NUM_PITCH_CLASSES; i++) {
+        float norm = (maxHpc > 0.001f) ? (hpsPitchClass[i] / maxHpc) : 0.0f;
+        payload[53 + i] = (uint8_t)(norm * 255.0f + 0.5f);
+    }
     payload[65] = dominantPitch;
     payload[66] = dominantPitchStrength;
     payload[67] = vocalSustain;
@@ -668,7 +703,7 @@ void sendFftFrame() {
 // [30]    majorPeakMag (0-255)
 // [31]    spectralFlux (0-255)
 // [32]    peakDetected (0/1)
-// [33]    activeBands
+// [33]    activeBands (fixed 12)
 // [34-35] reserved
 static void sendAuxFrame() {
     uint8_t payload[Proto::AUX_PAYLOAD_LEN] = {0};
@@ -683,7 +718,7 @@ static void sendAuxFrame() {
     payload[30] = majorPeakMag;
     payload[31] = spectralFlux8;
     payload[32] = peakDetected;
-    payload[33] = static_cast<uint8_t>(activeBands);
+    payload[33] = static_cast<uint8_t>(BANDS_12);
 
     uint8_t frame[1 + 1 + 1 + 1 + Proto::AUX_PAYLOAD_LEN + 2 + 1];
     size_t frameLen = 0;
@@ -749,21 +784,7 @@ void forwardESP32Commands() {
 
     // Always use 12 bands for all music patterns to keep visuals consistent
     if (mode == 'M') {
-        currentPattern = pattern;
-        int newBands = BANDS_12;
-        if (newBands != activeBands) {
-            activeBands = newBands;
-            // Clear smoothed values when switching band counts
-            for (int i = 0; i < MAX_BANDS; i++) {
-                smoothedBandAmplitude[i] = 0;
-                lastCalibratedEnergy[i] = 0;
-                bandVisFft[i] = 0.0f;
-                bandVis8[i] = 0;
-                bandDelta8[i] = 0;
-            }
-            globalVisAvg = 0.0f;
-            Serial.printf("[FFT] Switched to %d bands for pattern %d\n", activeBands, pattern);
-        }
+        // No-op: fixed 12-band mode
     }
 
     uint8_t frame[1 + 1 + 1 + 1 + Proto::CMD_PAYLOAD_LEN + 2 + 1];
@@ -773,7 +794,7 @@ void forwardESP32Commands() {
     }
 
     if (Serial) {
-        Serial.printf("Mode: %c, Pattern: %d, Brightness: %d, Bands: %d\n", mode, pattern, brightness, activeBands);
+        Serial.printf("Mode: %c, Pattern: %d, Brightness: %d, Bands: %d\n", mode, pattern, brightness, BANDS_12);
     }
 }
 
@@ -807,7 +828,9 @@ void setup() {
     Serial.println("========================================\n");
 
     // Initialize chord detection lookup table
-    initChromaMapping();
+    initPitchMapping();
+    for (int i = 0; i <= HPS_BIN_END; i++) hpsSmoothed[i] = 0.0f;
+    for (int i = 0; i < NUM_PITCH_CLASSES; i++) hpsPitchClass[i] = 0.0f;
 
     AudioMemory(60);
     delay(500);
@@ -857,11 +880,12 @@ void loop() {
         }
         Serial.print("FFT SPDIF:");
         Serial.print(spdifInput.pllLocked() ? "LOCK" : "NOLOCK");
-        // Dominant pitch info
+        // HPS pitch info
         Serial.print(" Note:");
         if (dominantPitch < 12) {
             Serial.print(pitchNames[dominantPitch]);
-            Serial.print("(");
+            Serial.print(dominantPitchHz);
+            Serial.print("Hz(");
             Serial.print(dominantPitchStrength);
             Serial.print(")");
         } else {
@@ -896,11 +920,11 @@ void loop() {
         Serial.print(peakCpuPct, 1);
         Serial.print("%");
         Serial.print(" Bands(");
-        Serial.print(activeBands);
+        Serial.print(BANDS_12);
         Serial.print("):");
-        for (int i = 0; i < activeBands; i++) {
+        for (int i = 0; i < BANDS_12; i++) {
             Serial.print(smoothedBandAmplitude[i], 4);
-            if (i < activeBands - 1) Serial.print(",");
+            if (i < BANDS_12 - 1) Serial.print(",");
         }
         Serial.println();
 

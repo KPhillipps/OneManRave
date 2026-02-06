@@ -2,6 +2,7 @@
 #include <FastLED.h>
 #include "Globals.h"
 #include "ColorDefinitions.h"
+#include "MusicVisualization.h"
 
 // ============================================================================
 // Music Visualizations for LED Teensy (receives FFT data via Serial1)
@@ -9,35 +10,21 @@
 // This file contains FFT-reactive visualizations. The FFT processing happens
 // on the FFT Teensy; this device receives pre-computed bandAmplitude[] data.
 
+// Forward declaration for effects defined before bandVis[]/globalVis definition
+extern float bandVis[MAX_BANDS];
+extern float globalVis;
+
 // Matrix dimensions
 const int matrix_height = 144; // LEDs per virtual strip
-
-// Chroma bins alias (for aurora visualizations)
-#ifndef HAS_CHROMA_BINS
-static float chromaBinsFallback[12] = {0};
-static float* chromaBins = chromaBinsFallback;
-#else
-extern float chroma[12];
-static float* chromaBins = chroma;
-#endif
-
 
 #define COOLING 150
 #define SPARKING 80
 
-static const CRGBPalette16 auroraPalette = CRGBPalette16(
-    CRGB(2, 4, 20),   CRGB(3, 8, 35),   CRGB(5, 18, 60),  CRGB(0, 40, 90),
-    CRGB(0, 70, 120), CRGB(0, 110, 150), CRGB(0, 140, 160), CRGB(10, 170, 170),
-    CRGB(40, 200, 180), CRGB(90, 220, 190), CRGB(160, 235, 210), CRGB(220, 240, 230),
-    CRGB(255, 255, 235), CRGB(180, 230, 220), CRGB(80, 200, 190), CRGB(10, 120, 150)
-);
-
-static const CRGBPalette16 vocalAuroraPalette = CRGBPalette16(
-    CRGB(2, 4, 18),   CRGB(4, 8, 28),   CRGB(6, 14, 45),  CRGB(10, 24, 70),
-    CRGB(18, 36, 95), CRGB(22, 50, 120), CRGB(30, 70, 150), CRGB(48, 95, 180),
-    CRGB(70, 120, 210), CRGB(100, 150, 230), CRGB(130, 180, 240), CRGB(170, 210, 250),
-    CRGB(200, 225, 255), CRGB(150, 200, 240), CRGB(90, 160, 220), CRGB(40, 110, 190)
-);
+// Fire2012-style audio-reactive fire effect (runtime-tunable)
+static const uint8_t FIRE_SPARK_ZONE = 20;  // Bottom N pixels where sparks can ignite
+static uint8_t fireCooling = 75;            // How fast flames cool (higher = shorter flames)
+static uint8_t fireSparking = 120;          // Base spark probability (0-255)
+static float fireAudioBoost = 1.5f;         // Multiply band amplitude for spark intensity
 
 static const CRGBPalette16 meteoritePalette = CRGBPalette16(
     CRGB(2, 0, 0),    CRGB(6, 0, 0),    CRGB(14, 0, 0),   CRGB(28, 0, 0),
@@ -47,35 +34,50 @@ static const CRGBPalette16 meteoritePalette = CRGBPalette16(
 );
 
 // Peak sparks: a few per column is enough
-struct PeakSpark { float y; uint8_t hue; uint8_t life; bool alive; };
+struct PeakSpark { float y; float v; uint8_t hue; uint8_t life; bool alive; };
 static PeakSpark sparks[NUM_VIRTUAL_STRIPS][3];
 static float prevStripLevel[NUM_VIRTUAL_STRIPS] = {0};
+static float stripDeltaLocal[NUM_VIRTUAL_STRIPS] = {0};
 static uint8_t sparkCooldown[NUM_VIRTUAL_STRIPS] = {0};
+static float prevGlobalLevel = 0.0f;
 
 void Fire2012WithAudioEnhanced() {
     // Uses bandAmplitude[] which is updated via Serial1 from FFT Teensy
     static uint8_t heat[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
 
+    const bool auxFresh = (lastAuxPacketMs != 0) && (millis() - lastAuxPacketMs < 200);
+    float globalLevel = auxFresh ? (globalVis8 / 255.0f) : globalVis;
+    float globalDelta = globalLevel - prevGlobalLevel;
+    if (globalDelta < 0.0f) globalDelta = 0.0f;
+    prevGlobalLevel = globalLevel;
+
     // Spawn sparks on rising peaks (band index == strip index, 12 bands/strips)
     for (int strip = 0; strip < NUM_VIRTUAL_STRIPS; strip++) {
-        float a = constrain(bandAmplitude[strip], 0.0f, 1.0f);
-        float delta = a - prevStripLevel[strip];
-        prevStripLevel[strip] = a;
+        float e = (strip < MAX_BANDS) ? bandVis[strip] : 0.0f;
+        float delta = e - prevStripLevel[strip];
+        prevStripLevel[strip] = e;
+        float d = (delta > 0.0f) ? delta : 0.0f;
+        if (auxFresh && strip < MAX_BANDS) {
+            d = bandDelta8[strip] / 255.0f;
+        }
+        stripDeltaLocal[strip] = d;
 
         if (sparkCooldown[strip] > 0) {
             sparkCooldown[strip]--;
         }
 
-        const bool strongPeak = (delta > 0.07f) && (a > 0.12f);
+        const bool strongPeak = (d > 0.10f) && (e > 0.06f);
         if (strongPeak && sparkCooldown[strip] == 0) {
             for (int i = 0; i < 3; i++) {
                 PeakSpark &sp = sparks[strip][i];
                 if (!sp.alive) {
                     sp.alive = true;
-                    sp.y = 0.0f;
-                    sp.hue = 16 + (uint8_t)(a * 96.0f);
-                    sp.life = 220;
-                    sparkCooldown[strip] = 6;
+                    sp.y = (float)random8(2);
+                    sp.v = 0.9f + (e * 2.4f) + (d * 2.0f);
+                    sp.hue = 8 + (uint8_t)(strip * 4) + (uint8_t)(e * 24.0f);
+                    uint16_t life = 180 + (uint16_t)(e * 60.0f) + (uint16_t)(d * 40.0f);
+                    sp.life = (life > 255) ? 255 : (uint8_t)life;
+                    sparkCooldown[strip] = 5;
                     break;
                 }
             }
@@ -83,30 +85,44 @@ void Fire2012WithAudioEnhanced() {
     }
 
     for (int strip = 0; strip < NUM_VIRTUAL_STRIPS; strip++) {
+        float e = (strip < MAX_BANDS) ? bandVis[strip] : 0.0f;
+        float d = (auxFresh && strip < MAX_BANDS) ? (bandDelta8[strip] / 255.0f) : stripDeltaLocal[strip];
+
+        uint8_t cooling = fireCooling;
+        int coolBias = (int)(e * 40.0f) + (int)(globalLevel * 25.0f);
+        if (coolBias > 0) {
+            cooling = (uint8_t)constrain((int)cooling - coolBias, 30, 220);
+        }
+
         // Cool down cells
         for (int i = 0; i < LEDS_PER_VIRTUAL_STRIP; i++) {
-            heat[strip][i] = qsub8(heat[strip][i], random8(0, ((COOLING * 5) / LEDS_PER_VIRTUAL_STRIP) + 2));
+            heat[strip][i] = qsub8(heat[strip][i], random8(0, ((cooling * 5) / LEDS_PER_VIRTUAL_STRIP) + 2));
         }
 
         // Heat drifts upward
-        for (int k = LEDS_PER_VIRTUAL_STRIP - 1; k >= 2; k--) {
-            heat[strip][k] = (heat[strip][k - 1] + heat[strip][k - 2]) / 2;
+        for (int k = LEDS_PER_VIRTUAL_STRIP - 1; k >= 3; k--) {
+            heat[strip][k] = (heat[strip][k - 1] * 3 + heat[strip][k - 2] * 2 + heat[strip][k - 3]) / 6;
         }
 
-        // Random sparks
-        if (random8() < SPARKING) {
-            int y = random8(7);
-            heat[strip][y] = qadd8(heat[strip][y], random8(160, 255));
-        }
+        uint8_t e8 = (uint8_t)constrain(e * 255.0f, 0.0f, 255.0f);
+        uint8_t d8 = (uint8_t)constrain(d * 255.0f, 0.0f, 255.0f);
+        uint8_t g8 = (uint8_t)constrain(globalLevel * 255.0f, 0.0f, 255.0f);
+        uint8_t flux8 = (uint8_t)constrain((auxFresh ? (spectralFlux8 / 255.0f) : globalDelta) * 255.0f, 0.0f, 255.0f);
 
-        // Audio-based sparks (band index == strip index, 12 bands/strips)
-        int band = strip;
-        if (band >= 0 && band < MAX_BANDS) {
-            float audioLevel = bandAmplitude[band];
-            if (audioLevel > 0.01f) {
-                int y = random8(7);
-                heat[strip][y] = qadd8(heat[strip][y], (uint8_t)(audioLevel * 255.0f));
-            }
+        // Random + audio-driven sparks
+        uint8_t sparkChance = fireSparking;
+        sparkChance = qadd8(sparkChance, scale8(e8, 140));
+        sparkChance = qadd8(sparkChance, scale8(d8, 200));
+        sparkChance = qadd8(sparkChance, scale8(g8, 60));
+        sparkChance = qadd8(sparkChance, scale8(flux8, 80));
+
+        if (random8() < sparkChance) {
+            int y = random8(FIRE_SPARK_ZONE);
+            uint8_t heatAdd = 140;
+            heatAdd = qadd8(heatAdd, scale8(e8, 90));
+            heatAdd = qadd8(heatAdd, scale8(d8, 90));
+            heatAdd = qadd8(heatAdd, scale8(g8, 40));
+            heat[strip][y] = qadd8(heat[strip][y], heatAdd);
         }
 
         // Map heat to LED colors with flicker
@@ -130,7 +146,8 @@ void Fire2012WithAudioEnhanced() {
                 *virtualLeds[strip][y] += CHSV(sp.hue, 200, sp.life);
             }
 
-            sp.y += 1.0f + (sp.life / 128.0f);
+            sp.y += sp.v;
+            sp.v *= 0.96f;
             sp.life = qsub8(sp.life, 12);
             if (sp.y >= LEDS_PER_VIRTUAL_STRIP || sp.life == 0) {
                 sp.alive = false;
@@ -144,6 +161,7 @@ void Fire2012WithAudioEnhanced() {
 void RedCometWithAudio1() {
     static uint8_t heat[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
     const uint8_t cooling = 150;
+    const bool auxFresh = (lastAuxPacketMs != 0) && (millis() - lastAuxPacketMs < 200);
 
     for (int strip = 0; strip < NUM_VIRTUAL_STRIPS; strip++) {
         // Cool down cells to simulate fading effect
@@ -154,13 +172,17 @@ void RedCometWithAudio1() {
         // Audio-based comet trigger (band index == strip index, 12 bands/strips)
         int band = strip;
         if (band >= 0 && band < MAX_BANDS) {
-            float audioLevel = bandAmplitude[band];
-            if (audioLevel > 0.01f) {
+            float audioLevel = bandVis[band];
+            float delta = auxFresh ? (bandDelta8[band] / 255.0f) : 0.0f;
+            float trigger = audioLevel + (delta * 0.7f);
+            if (trigger > 0.06f) {
                 int base = (int)(LEDS_PER_VIRTUAL_STRIP * 0.2f);
                 int peakMin = max(0, base - 10);
                 int peakMax = min(LEDS_PER_VIRTUAL_STRIP, base + 10);
                 int peakPosition = random8(peakMin, peakMax);
-                heat[strip][peakPosition] = qadd8(heat[strip][peakPosition], (uint8_t)(audioLevel * 255.0f * 2.0f));
+                float intensity = (audioLevel * 2.0f) + (delta * 1.5f);
+                heat[strip][peakPosition] = qadd8(heat[strip][peakPosition],
+                                                  (uint8_t)constrain(intensity * 255.0f, 0.0f, 255.0f));
             }
         }
 
@@ -325,324 +347,6 @@ void meteoriteRain(bool reset) {
     FastLED.show();
 }
 
-void vocalAurora(bool reset) {
-    static bool initialized = false;
-    static uint16_t xOff = 0;
-    static uint16_t yOff = 0;
-    static uint16_t tOff = 0;
-    static uint8_t hueShift = 0;
-    static float energy[12] = {0};
-    static float bandPeakMax[12] = {0};
-    static uint8_t sparkleCooldown[12] = {0};
-    static bool blobActive[12] = {0};
-    static float blobY[12] = {0};
-    static float blobV[12] = {0};
-    static int8_t blobDrift[12] = {0};
-    static uint8_t sparkleClusterX[12] = {0};
-    static uint8_t sparkleClusterY[12] = {0};
-    static uint8_t sparkleClusterTimer[12] = {0};
-    static uint8_t paletteBias = 0;
-    static uint32_t lastMs = 0;
-    static uint32_t lastFrameMs = 0;
-
-    if (reset || !initialized) {
-        memset(energy, 0, sizeof(energy));
-        memset(blobActive, 0, sizeof(blobActive));
-        memset(blobY, 0, sizeof(blobY));
-        memset(blobV, 0, sizeof(blobV));
-        memset(blobDrift, 0, sizeof(blobDrift));
-        memset(bandPeakMax, 0, sizeof(bandPeakMax));
-        memset(sparkleCooldown, 0, sizeof(sparkleCooldown));
-        memset(sparkleClusterX, 0, sizeof(sparkleClusterX));
-        memset(sparkleClusterY, 0, sizeof(sparkleClusterY));
-        memset(sparkleClusterTimer, 0, sizeof(sparkleClusterTimer));
-        xOff = 0;
-        yOff = 0;
-        tOff = 0;
-        hueShift = 0;
-        paletteBias = 0;
-        lastMs = millis();
-        lastFrameMs = 0;
-        FastLED.clear();
-        FastLED.show();
-        initialized = true;
-        return;
-    }
-
-    processSerialData();
-    if (serialDataPending) {
-        return;
-    }
-
-    uint32_t now = millis();
-    if (now - lastFrameMs < 16) {
-        return;  // ~60 FPS
-    }
-    lastFrameMs = now;
-
-    uint32_t dt = (lastMs == 0) ? 16 : (now - lastMs);
-    lastMs = now;
-
-    // Slow upward drift and gentle time evolution
-    yOff += (uint16_t)(dt * 2);
-    xOff += (uint16_t)(dt * 1);
-    tOff += (uint16_t)(dt * 1);
-
-    int bands = currentBandCount;
-    if (bands < 1) bands = 1;
-    if (bands > 12) bands = 12;
-
-    int sparkleStart = 0;  // use whole field
-
-    float midHighSum = 0.0f;
-    for (int i = 0; i < 12; i++) {
-        float target = 0.0f;
-        if (i < bands) {
-            target = bandAmplitude[i] * 0.08f;  // assumes ~0..20 range
-            if (target > 1.0f) target = 1.0f;
-            if (target < 0.0f) target = 0.0f;
-        }
-
-        float prevEnergy = energy[i];
-        float alpha = (target > energy[i]) ? 0.4f : 0.08f;  // attack / release
-        energy[i] += (target - energy[i]) * alpha;
-        if (i >= 4) {
-            midHighSum += energy[i];
-        }
-
-        if (sparkleCooldown[i] > 0) {
-            sparkleCooldown[i]--;
-        }
-
-        // Track a slow-decaying per-band peak to make triggers relative (works at low volume)
-        float peak = bandPeakMax[i] * 0.96f;
-        if (target > peak) peak = target;
-        if (peak < 0.08f) peak = 0.08f;  // floor so relative threshold doesn't vanish
-        bandPeakMax[i] = peak;
-
-        // Peak detection per-band: spawn dark blob + sparkle clusters
-        float rise = target - prevEnergy;
-        bool isPeak = (target > peak * 0.65f) && (rise > 0.04f);
-        if (isPeak) {
-            if (!blobActive[i] || random8() < 160) {
-                blobActive[i] = true;
-                blobY[i] = (float)(LEDS_PER_VIRTUAL_STRIP - 1);
-                blobV[i] = 1.0f + (energy[i] * 2.2f);
-                blobDrift[i] = (int8_t)random8(5) - 2;  // -2..+2 drift bias
-            }
-            bool vocalBand = (i >= 3 && i <= 7);  // mid bands (vocal-ish)
-            uint8_t chance = vocalBand ? 245 : 200;
-            if (sparkleCooldown[i] == 0 && random8() < chance) {
-                sparkleClusterTimer[i] = 4 + random8(vocalBand ? 5 : 3);  // ~60-120ms
-                int8_t drift = (int8_t)random8(5) - 2;  // -2..+2
-                int xCenter = i + drift;
-                if (xCenter < 0) xCenter = 0;
-                if (xCenter >= NUM_VIRTUAL_STRIPS) xCenter = NUM_VIRTUAL_STRIPS - 1;
-                sparkleClusterX[i] = (int8_t)xCenter;
-                sparkleClusterY[i] = (int8_t)random(0, LEDS_PER_VIRTUAL_STRIP);
-                sparkleCooldown[i] = 6 + random8(6);
-            }
-        }
-
-        // Sustain clusters while band is active (helps vocal words)
-        if (sparkleClusterTimer[i] > 0) {
-            if (target > 0.18f) {
-                if (sparkleClusterTimer[i] < 2) {
-                    sparkleClusterTimer[i] = 2;
-                }
-            }
-        }
-    }
-
-
-    float brightnessScalar = midHighSum / 8.0f;
-    if (brightnessScalar > 1.0f) brightnessScalar = 1.0f;
-    if (brightnessScalar < 0.0f) brightnessScalar = 0.0f;
-
-    // Chroma dominance (subtle hue/palette bias)
-    float chromaMax = 0.0f;
-    int chromaIdx = 0;
-    for (int i = 0; i < 12; i++) {
-        float c = chromaBins[i];
-        if (c > chromaMax) {
-            chromaMax = c;
-            chromaIdx = i;
-        }
-    }
-    if (chromaMax > 0.35f) {
-        paletteBias = (uint8_t)(chromaIdx * 10);
-    } else {
-        paletteBias = qsub8(paletteBias, 1);
-    }
-
-    uint8_t paletteOffset = hueShift + paletteBias;
-    hueShift += 1;
-
-    // Render base aurora flow (12 columns)
-    for (int x = 0; x < NUM_VIRTUAL_STRIPS; x++) {
-        // Column-specific noise offsets
-        uint16_t xo = xOff + x * 120;
-        uint16_t yo = yOff;
-        uint16_t to = tOff;
-
-        for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
-            uint8_t n = inoise8(xo, yo + y * 35, to);
-            uint8_t idx = qadd8(n, paletteOffset);
-            uint8_t brt = scale8(n, (uint8_t)(140 + brightnessScalar * 100.0f));
-
-            // Slight vertical falloff for softer top
-            uint8_t falloff = scale8(brt, (uint8_t)(255 - (y * 180 / LEDS_PER_VIRTUAL_STRIP)));
-            *virtualLeds[x][y] = ColorFromPalette(vocalAuroraPalette, idx, falloff, LINEARBLEND);
-        }
-    }
-
-    // Overlay vocal blobs and sparkle clusters
-    for (int b = sparkleStart; b < 12; b++) {
-        if (blobActive[b]) {
-            float y = blobY[b];
-            int strip = b;
-            if (strip < 0) strip = 0;
-            if (strip >= NUM_VIRTUAL_STRIPS) strip = NUM_VIRTUAL_STRIPS - 1;
-
-            for (int k = -2; k <= 2; k++) {
-                int yy = (int)y + k;
-                if (yy >= 0 && yy < LEDS_PER_VIRTUAL_STRIP) {
-                    uint8_t bval = (uint8_t)(200 - abs(k) * 40);
-                    *virtualLeds[strip][yy] += CHSV(160 + hueShift, 40, bval);
-                }
-            }
-
-            blobY[b] -= blobV[b];
-            blobV[b] *= 0.98f;
-            blobY[b] += (float)blobDrift[b] * 0.15f;
-            if (blobY[b] < 0 || blobV[b] < 0.05f) {
-                blobActive[b] = false;
-            }
-        }
-
-        if (sparkleClusterTimer[b] > 0) {
-            sparkleClusterTimer[b]--;
-            int cx = sparkleClusterX[b];
-            int cy = sparkleClusterY[b];
-            for (int s = 0; s < 6; s++) {
-                int x = cx + (int8_t)random8(3) - 1;
-                int y = cy + (int8_t)random8(5) - 2;
-                if (x < 0) x = 0;
-                if (x >= NUM_VIRTUAL_STRIPS) x = NUM_VIRTUAL_STRIPS - 1;
-                if (y < 0) y = 0;
-                if (y >= LEDS_PER_VIRTUAL_STRIP) y = LEDS_PER_VIRTUAL_STRIP - 1;
-                uint8_t v = (uint8_t)(150 + random8(80));
-                *virtualLeds[x][y] += CHSV(140 + hueShift, 30, v);
-            }
-        }
-    }
-
-    FastLED.show();
-}
-
-void harmonicAurora(bool reset) {
-    static bool initialized = false;
-    static uint16_t xOff = 0;
-    static uint16_t yOff = 0;
-    static uint16_t tOff = 0;
-    static uint8_t hueShift = 0;
-    static uint32_t lastMs = 0;
-    static uint32_t lastFrameMs = 0;
-    static float energy[12] = {0};
-    static float bandPeakMax[12] = {0};
-
-    if (reset || !initialized) {
-        memset(energy, 0, sizeof(energy));
-        memset(bandPeakMax, 0, sizeof(bandPeakMax));
-        xOff = 0;
-        yOff = 0;
-        tOff = 0;
-        hueShift = 0;
-        lastMs = millis();
-        lastFrameMs = 0;
-        FastLED.clear();
-        FastLED.show();
-        initialized = true;
-        return;
-    }
-
-    processSerialData();
-    if (serialDataPending) {
-        return;
-    }
-
-    uint32_t now = millis();
-    if (now - lastFrameMs < 16) {
-        return;  // ~60 FPS
-    }
-    lastFrameMs = now;
-
-    uint32_t dt = (lastMs == 0) ? 16 : (now - lastMs);
-    lastMs = now;
-
-    // Slow upward drift and gentle time evolution
-    yOff += (uint16_t)(dt * 2);
-    xOff += (uint16_t)(dt * 1);
-    tOff += (uint16_t)(dt * 1);
-
-    int bands = currentBandCount;
-    if (bands < 1) bands = 1;
-    if (bands > 12) bands = 12;
-
-    float energySum = 0.0f;
-    for (int i = 0; i < 12; i++) {
-        float target = 0.0f;
-        if (i < bands) {
-            target = bandAmplitude[i] * 0.07f;  // assumes ~0..20 range
-            if (target > 1.0f) target = 1.0f;
-            if (target < 0.0f) target = 0.0f;
-        }
-
-        float alpha = (target > energy[i]) ? 0.3f : 0.07f;  // attack / release
-        energy[i] += (target - energy[i]) * alpha;
-        energySum += energy[i];
-
-        // Track a slow-decaying per-band peak to make triggers relative
-        float peak = bandPeakMax[i] * 0.97f;
-        if (target > peak) peak = target;
-        if (peak < 0.06f) peak = 0.06f;
-        bandPeakMax[i] = peak;
-    }
-
-    float brightnessScalar = energySum / 9.0f;
-    if (brightnessScalar > 1.0f) brightnessScalar = 1.0f;
-    if (brightnessScalar < 0.0f) brightnessScalar = 0.0f;
-
-    // Chroma dominance (subtle hue bias)
-    float chromaMax = 0.0f;
-    int chromaIdx = 0;
-    for (int i = 0; i < 12; i++) {
-        float c = chromaBins[i];
-        if (c > chromaMax) {
-            chromaMax = c;
-            chromaIdx = i;
-        }
-    }
-    uint8_t paletteOffset = hueShift + (uint8_t)(chromaMax > 0.30f ? chromaIdx * 10 : 0);
-    hueShift += 1;
-
-    for (int x = 0; x < NUM_VIRTUAL_STRIPS; x++) {
-        uint16_t xo = xOff + x * 110;
-        uint16_t yo = yOff;
-        uint16_t to = tOff;
-
-        for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
-            uint8_t n = inoise8(xo, yo + y * 30, to);
-            uint8_t idx = qadd8(n, paletteOffset);
-            uint8_t brt = scale8(n, (uint8_t)(120 + brightnessScalar * 120.0f));
-            uint8_t falloff = scale8(brt, (uint8_t)(255 - (y * 160 / LEDS_PER_VIRTUAL_STRIP)));
-            *virtualLeds[x][y] = ColorFromPalette(auroraPalette, idx, falloff, LINEARBLEND);
-        }
-    }
-
-    FastLED.show();
-}
-
 // ============================================================================
 // Audio Visualization State
 // ============================================================================
@@ -657,14 +361,6 @@ const bool  FLIP_BARS_VERT = false;  // Set true if bars appear inverted
 // ============================================================================
 // Fire Visualization Constants and State
 // ============================================================================
-// Fire2012-style audio-reactive fire effect
-static const uint8_t FIRE_SPARK_ZONE = 20;  // Bottom N pixels where sparks can ignite
-
-// Runtime-tunable fire parameters (set defaults here)
-static uint8_t fireCooling = 75;    // How fast flames cool (higher = shorter flames)
-static uint8_t fireSparking = 120;  // Base spark probability (0-255)
-static float fireAudioBoost = 1.5f; // Multiply band amplitude for spark intensity
-
 // Fire color palette - warm fire colors (black -> red -> orange -> yellow -> white)
 DEFINE_GRADIENT_PALETTE(fireAudio_gp) {
     0,    0,   0,   0,    // black
@@ -1132,16 +828,14 @@ static void renderMusicVisualization() {
             renderEQFire();
             break;
         case 7:
-            // Harmonic Aurora (12-band music visualization)
-            harmonicAurora(false);
+            AuroraOrganic_Run(false);
             break;
         case 8:
             // Fire2012 with audio-driven sparks
             Fire2012WithAudioEnhanced();
             break;
         case 9:
-            // Vocal Aurora (vocal-only visualization)
-            vocalAurora(false);
+            AuroraNoteSparks_Run(false);
             break;
         case 10:
             // Meteorite Rain (sound-reactive peak echoes)

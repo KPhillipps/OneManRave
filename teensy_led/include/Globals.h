@@ -41,7 +41,6 @@
 #define NUM_VIRTUAL_STRIPS 12                // Virtual strips (each physical → 2 virtual)
 #define MAX_BANDS 12                         // Maximum FFT frequency bands
 #define BANDS_12 12                          // 12 bands for M patterns 0-5
-#define BANDS_10 10                          // Legacy: unused (kept for compatibility)
 
 // ============================================================================
 // Pin Configuration
@@ -57,7 +56,7 @@ constexpr int STRIP_PINS[6] = {6, 7, 8, 2, 21, 5};
 // ============================================================================
 extern CRGB* virtualLeds[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
 extern float bandAmplitude[MAX_BANDS];  // Smoothed FFT band data from FFT Teensy
-extern int currentBandCount;            // Current active band count (10 or 12)
+extern int currentBandCount;            // Current active band count (12)
 extern float beatAmplitude;         // Disabled (no beat data in payload)
 extern uint8_t vocalEnv;            // 0-255 vocal envelope
 extern uint8_t vocalSyllable;       // 0/1 syllable hit

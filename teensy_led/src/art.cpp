@@ -1,9 +1,5 @@
-#include <stdint.h>  // Ensure uint32_t is defined
-
+#include <stdint.h>
 #include "Globals.h"
-
-
-static uint16_t xOffset = 0, yOffset = 0;  // Noise offsets
 
 void displayBitmap(const uint32_t* bitmap) {
     for (int stripIndex = 0; stripIndex < NUM_VIRTUAL_STRIPS; stripIndex++) {

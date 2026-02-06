@@ -27,8 +27,7 @@
 #define NUM_PHYSICAL_STRIPS 6                // Total physical strips
 #define NUM_VIRTUAL_STRIPS 12                // Virtual strips (each physical → 2 virtual)
 #define MAX_BANDS 12                         // Maximum FFT frequency bands
-#define BANDS_12 12                          // 12 bands for M patterns 0-5
-#define BANDS_10 10                          // 10 bands for M patterns 6-11
+#define BANDS_12 12                          // 12 bands (fixed)
 
 // ============================================================================
 // Pin Configuration
@@ -44,7 +43,7 @@ constexpr int STRIP_PINS[6] = {6, 7, 8, 2, 21, 5};
 // ============================================================================
 extern CRGB* virtualLeds[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
 extern float bandAmplitude[MAX_BANDS];  // Smoothed FFT band data from FFT Teensy
-extern int currentBandCount;            // Current active band count (10 or 12)
+extern int currentBandCount;            // Current active band count (12)
 extern float beatAmplitude;         // Beat amplitude from FFT Teensy
 extern uint8_t spdifLock;           // SPDIF lock status from FFT Teensy
 
@@ -67,6 +66,6 @@ extern volatile bool serialDataPending;  // Set by serialEvent callbacks
 void runPattern();
 void showArt();
 void processSerialData();
-int getBandCountForPattern(int pattern);  // Returns 12 for patterns 0-5, 10 for 6-11
+int getBandCountForPattern(int pattern);  // Returns 12 for all patterns
 
 #endif
