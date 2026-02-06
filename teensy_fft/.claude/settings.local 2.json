@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(mdfind:*)",
+      "Bash(sudo mdfind:*)"
+    ]
+  }
+}

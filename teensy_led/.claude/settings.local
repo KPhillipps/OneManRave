@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(system_profiler:*)",
+      "WebFetch(domain:koromix.dev)",
+      "WebFetch(domain:download.koromix.dev)",
+      "Bash(curl:*)",
+      "Bash(hdiutil attach:*)",
+      "Bash(sudo cp:*)",
+      "Bash(sudo chmod:*)",
+      "Bash(~/bin/tycmd list:*)",
+      "Bash(hdiutil detach:*)",
+      "WebFetch(domain:www.pjrc.com)",
+      "WebFetch(domain:forums.adafruit.com)",
+      "WebFetch(domain:forum.pjrc.com)",
+      "Bash(pkill:*)",
+      "Bash(kill:*)",
+      "Bash(pio run:*)",
+      "WebFetch(domain:www.youtube.com)",
+      "WebFetch(domain:mm.kno.wled.ge)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

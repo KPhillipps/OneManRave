@@ -1,0 +1,4 @@
+{
+  "platformio-ide.deviceMonitorSerialPort": "/dev/cu.usbmodem161029201",
+  "platformio-ide.uploadPort": "/dev/cu.usbmodem161029201"
+}

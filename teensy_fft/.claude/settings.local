@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(mdfind:*)",
+      "Bash(sudo mdfind:*)",
+      "Bash(lsof:*)",
+      "Bash(~/bin/tycmd list:*)",
+      "Bash(system_profiler:*)",
+      "Bash(kill:*)"
+    ]
+  }
+}

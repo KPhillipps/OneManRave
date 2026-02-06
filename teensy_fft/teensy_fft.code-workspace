@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../teensy_led"
+		}
+	],
+	"settings": {
+		"platformio-ide.deviceMonitorSerialPort": "auto",
+		"platformio-ide.uploadPort": "auto"
+	}
+}
