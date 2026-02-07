@@ -5,6 +5,7 @@
 
 // Declare each function from Patterns.cpp
 void runPattern();
+void CloudParallax_Pattern(bool reset=false);
 // Add other function declarations as needed
 
 #endif

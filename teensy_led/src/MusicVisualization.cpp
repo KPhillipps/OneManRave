@@ -2,6 +2,9 @@
 #include <FastLED.h>
 #include "Globals.h"
 #include "ColorDefinitions.h"
+#include "Patterns.h"  // for CloudParallax_Pattern background reuse
+
+extern uint8_t dominantPitch;
 #include "MusicVisualization.h"
 
 // ============================================================================
@@ -39,6 +42,9 @@ static PeakSpark sparks[NUM_VIRTUAL_STRIPS][3];
 static float prevStripLevel[NUM_VIRTUAL_STRIPS] = {0};
 static float stripDeltaLocal[NUM_VIRTUAL_STRIPS] = {0};
 static uint8_t sparkCooldown[NUM_VIRTUAL_STRIPS] = {0};
+// Note hue lookup for pitch classes C..B
+// Note-hue helpers are unused for onset-only sparkles; kept for reference
+
 static float prevGlobalLevel = 0.0f;
 
 void Fire2012WithAudioEnhanced() {
@@ -400,9 +406,10 @@ const float VIS_SCALE = 0.005f;   // Divide raw values (73 → 0.36)
 const float VIS_LOG_K = 15.0f;    // Log compression strength
 
 // Per-band gain (low → high). Higher bands get more lift.
+// Heavier lift on upper bands; slight trim on lows to balance spectrum
 static const float bandGain[BANDS_12] = {
-    1.00f, 1.00f, 1.05f, 1.10f, 1.10f, 1.15f,
-    1.25f, 1.35f, 1.50f, 1.70f, 1.90f, 2.10f
+    0.90f, 0.95f, 1.00f, 1.05f, 1.10f, 1.20f,
+    1.50f, 1.80f, 2.20f, 2.60f, 3.00f, 3.40f
 };
 
 // Returns band count for Music mode pattern (always 12 bands).
@@ -439,8 +446,10 @@ void computeVisualBands() {
         float compressed = log1pf(VIS_LOG_K * scaled) / log1pf(VIS_LOG_K);
         float target = constrain(compressed, 0.0f, 1.0f);
 
-        // Light smoothing for stability
-        bandVis[i] = bandVis[i] * 0.7f + target * 0.3f;
+        // Adaptive smoothing: less smoothing on higher bands to let transients show
+        float smoothPrev = (i >= 9) ? 0.50f : (i >= 7 ? 0.60f : 0.70f);
+        float smoothNew  = 1.0f - smoothPrev;
+        bandVis[i] = bandVis[i] * smoothPrev + target * smoothNew;
 
         sumSq += bandVis[i] * bandVis[i];
     }
@@ -678,123 +687,95 @@ static void renderEQBarsMono() {
 // Fire2012-style Audio-Reactive Fire Visualization
 // ============================================================================
 // Each strip's fire intensity is driven by its corresponding frequency band.
-// Uses proper heat diffusion for realistic flame movement.
+// Audio-reactive fire: hot spots injected at bottom travel visibly upward.
+// Aggressive cooling keeps baseline low so transients pop as bright bands
+// rising through the flame column.
 static void renderEQFire() {
     int bands = currentBandCount;
     if (bands < 1) bands = 1;
     if (bands > MAX_BANDS) bands = MAX_BANDS;
 
-    int stripStart = 0;
-    int stripLimit = NUM_VIRTUAL_STRIPS;
-
     const bool auxFresh = (lastAuxPacketMs != 0 && (millis() - lastAuxPacketMs) < 200);
     const float flux = auxFresh ? (spectralFlux8 / 255.0f) : 0.0f;
-    const float peakMag = auxFresh ? (majorPeakMag / 255.0f) : 0.0f;
-    const bool peakGate = auxFresh && (peakDetected != 0);
 
-    // Initialize heat array on first run
     if (!fireInitialized) {
         memset(fireHeat, 0, sizeof(fireHeat));
         fireInitialized = true;
     }
 
-    static float bandPeak[MAX_BANDS] = {0};
-
-    // Cooling reduction on peaks/flux for taller flames
-    uint8_t coolingAmount = fireCooling;
-    if (peakGate) {
-        coolingAmount = (uint8_t)max(5, (int)coolingAmount - 30);
-    }
-    if (flux > 0.4f) {
-        coolingAmount = (uint8_t)max(5, (int)coolingAmount - (int)(flux * 40.0f));
-    }
+    // Cooling is CONSTANT - never reduced on peaks. This is critical:
+    // flames must fall back fast so the next hit creates visible contrast.
+    const uint8_t cooling = fireCooling;
 
     for (int band = 0; band < bands; band++) {
-        int strip = stripStart + band;
-        if (strip >= stripLimit) continue;
+        int strip = band;
+        if (strip >= NUM_VIRTUAL_STRIPS) continue;
 
         float bandLevel = bandVis[band];
         float transient = auxFresh ? (bandDelta8[band] / 255.0f) : 0.0f;
-        float burst = (transient * 1.5f) + (flux * 0.6f) + (peakMag * 0.4f);
-        // Track a slow-decaying peak so spikes push flames higher
-        bandPeak[band] *= 0.94f;
-        if (bandLevel > bandPeak[band]) {
-            bandPeak[band] = bandLevel;
-        }
-        if (bandPeak[band] < 0.05f) bandPeak[band] = 0.05f;
-        float peakRatio = bandLevel / bandPeak[band];  // 0..1 relative peak
 
-        // Step 1: Cool down every cell a little
-        uint8_t bandCooling = coolingAmount;
-        if (peakRatio > 0.75f) {
-            bandCooling = (uint8_t)max(5, (int)coolingAmount - (int)(peakRatio * 40.0f));
-        }
+        // Step 1: Cool down - heavier cooling higher up so flames taper.
+        // Bottom 20px cool slower (embers persist), upper region cools fast.
         for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
-            // More cooling at top (flames taper naturally)
-            uint8_t cooldown = random8(0, ((bandCooling * 10) / LEDS_PER_VIRTUAL_STRIP) + 2);
+            // Scale cooling: bottom gets 60% of base, top gets 140%
+            uint8_t heightScale = 60 + (uint8_t)((uint16_t)y * 80 / LEDS_PER_VIRTUAL_STRIP);
+            uint8_t localCool = (uint8_t)(((uint16_t)cooling * heightScale) / 100);
+            uint8_t cooldown = random8(0, ((localCool * 10) / LEDS_PER_VIRTUAL_STRIP) + 2);
             fireHeat[strip][y] = qsub8(fireHeat[strip][y], cooldown);
         }
 
-        // Step 2: Heat rises - diffuse upward
-        for (int y = LEDS_PER_VIRTUAL_STRIP - 1; y >= 2; y--) {
-            fireHeat[strip][y] = (fireHeat[strip][y - 1] + fireHeat[strip][y - 2] + fireHeat[strip][y - 2]) / 3;
+        // Step 2: Heat rises - LIGHT diffusion that preserves hot spots.
+        // Instead of averaging 3 cells (which smears everything), shift heat
+        // upward with minimal blending so a hot injection travels as a visible
+        // bright band moving up the strip.
+        for (int y = LEDS_PER_VIRTUAL_STRIP - 1; y >= 3; y--) {
+            // 60% from cell below, 25% from 2 below, 15% from 3 below
+            // This carries heat upward sharply rather than smearing it
+            fireHeat[strip][y] = (uint8_t)(
+                ((uint16_t)fireHeat[strip][y - 1] * 155 +
+                 (uint16_t)fireHeat[strip][y - 2] * 64 +
+                 (uint16_t)fireHeat[strip][y - 3] * 37) >> 8
+            );
         }
 
-        // Step 3: Audio-driven sparking at the bottom
-        // Spark intensity scales with band amplitude + transients + flux
-        uint8_t sparkIntensity = (uint8_t)constrain((bandLevel * fireAudioBoost + burst) * 255.0f, 0.0f, 255.0f);
-        if (sparkIntensity > 255) sparkIntensity = 255;
-
-        // Base sparking + audio boost
-        uint8_t sparkChance = fireSparking;
-        sparkChance = qadd8(sparkChance, (uint8_t)(bandLevel * 120.0f));
-        sparkChance = qadd8(sparkChance, (uint8_t)(transient * 140.0f));
-        sparkChance = qadd8(sparkChance, (uint8_t)(flux * 60.0f));
-        if (peakGate) sparkChance = qadd8(sparkChance, 30);
-        if (peakRatio > 0.75f) {
-            sparkChance = qadd8(sparkChance, (uint8_t)(peakRatio * 60.0f));
-        }
-        if (random8() < sparkChance) {
+        // Step 3: Audio sparking - concentrated on real transients only.
+        // Low base sparking keeps a dim ember glow; transients inject HOT.
+        uint8_t baseChance = fireSparking / 3;  // low idle spark rate
+        if (random8() < baseChance) {
             int y = random8(FIRE_SPARK_ZONE);
-            // Spark intensity based on audio level
-            uint8_t newHeat = (sparkIntensity > 100) ? sparkIntensity : random8(160, 255);
-            if (peakRatio > 0.8f) {
-                newHeat = qadd8(newHeat, (uint8_t)(peakRatio * 80.0f));
-            }
-            if (peakGate) {
-                newHeat = qadd8(newHeat, 40);
-            }
-            fireHeat[strip][y] = qadd8(fireHeat[strip][y], newHeat);
+            fireHeat[strip][y] = qadd8(fireHeat[strip][y], random8(80, 140));
         }
 
-        // Extra sparks on loud bands or transients
-        if (bandLevel > 0.3f || transient > 0.2f) {
-            int extraSparks = (int)(bandLevel * 4 + transient * 3);
-            for (int i = 0; i < extraSparks; i++) {
-                int y = random8(FIRE_SPARK_ZONE);
-                fireHeat[strip][y] = qadd8(fireHeat[strip][y], random8(180, 255));
+        // Transient-driven burst: this is where reactivity lives.
+        // A strong bandDelta injects a concentrated hot band at the bottom
+        // that will travel upward as a visible pulse.
+        if (transient > 0.08f) {
+            uint8_t hotness = (uint8_t)constrain(transient * 400.0f, 120.0f, 255.0f);
+            // Inject heat across a narrow zone (3-8 pixels) for a cohesive band
+            int sparkCount = 3 + (int)(transient * 12.0f);
+            if (sparkCount > 10) sparkCount = 10;
+            for (int i = 0; i < sparkCount; i++) {
+                int y = random8(0, min(FIRE_SPARK_ZONE, 12));
+                fireHeat[strip][y] = qadd8(fireHeat[strip][y], hotness);
             }
         }
 
-        // Peak echo: inject a hotter spark to travel farther upward
-        if (peakRatio > 0.85f && random8() < 180) {
+        // Band energy adds moderate warmth (sustains flame height during loud passages)
+        if (bandLevel > 0.15f) {
+            uint8_t warmth = (uint8_t)(bandLevel * 100.0f);
             int y = random8(FIRE_SPARK_ZONE);
-            uint8_t echoHeat = (uint8_t)min(255, 200 + (int)(peakRatio * 55.0f));
-            fireHeat[strip][y] = qadd8(fireHeat[strip][y], echoHeat);
+            fireHeat[strip][y] = qadd8(fireHeat[strip][y], warmth);
         }
 
-        // Flux burst - extra sparks across all strips
-        if (flux > 0.5f && random8() < 200) {
-            int bursts = 1 + (int)(flux * 3.0f);
-            for (int i = 0; i < bursts; i++) {
-                int y = random8(FIRE_SPARK_ZONE);
-                fireHeat[strip][y] = qadd8(fireHeat[strip][y], 255);
-            }
+        // Spectral flux burst - big transient across all bands gets extra heat
+        if (flux > 0.3f && transient > 0.05f) {
+            uint8_t fluxHeat = (uint8_t)constrain(flux * 300.0f, 150.0f, 255.0f);
+            int y = random8(0, 8);  // very bottom for maximum travel distance
+            fireHeat[strip][y] = qadd8(fireHeat[strip][y], fluxHeat);
         }
 
         // Step 4: Map heat to fire colors
         for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
-            // Use the fire palette for realistic colors
             *virtualLeds[strip][y] = ColorFromPalette(firePalette, fireHeat[strip][y]);
         }
     }
@@ -802,8 +783,139 @@ static void renderEQFire() {
     FastLED.show();
 }
 
+// Simple sparkle overlay driven by vocal energy and note
+static void overlayVocalSparkles() {
+    // Onset: vocal syllable or strong delta in vocal bands
+    uint8_t maxDelta = 0;
+    for (int b = 3; b <= 7; b++) if (bandDelta8[b] > maxDelta) maxDelta = bandDelta8[b];
+    bool onset = vocalSyllable || (maxDelta > 45);
+    if (!onset) return;
+
+    // Single burst of ~50 neutral sparkles in a noisy circle
+    int count = 50;
+    float cx = random8(NUM_VIRTUAL_STRIPS);
+    float cy = random16(LEDS_PER_VIRTUAL_STRIP);
+    float baseR = 8.0f + (random8() / 255.0f) * 6.0f;
+    for (int i = 0; i < count; i++) {
+        float ang = (random16() / 65535.0f) * TWO_PI;
+        float r   = baseR + ((random8() / 255.0f) * 4.0f) - 2.0f;
+        int sx = (int)lroundf(cx + cosf(ang) * r);
+        int sy = (int)lroundf(cy + sinf(ang) * r);
+        if (sx < 0 || sx >= NUM_VIRTUAL_STRIPS || sy < 0 || sy >= LEDS_PER_VIRTUAL_STRIP) continue;
+        CRGB c = CHSV(160, 0, 255); // white/neutral
+        CRGB k0 = c;
+        CRGB k1 = c; k1.nscale8_video(160);
+        CRGB k2 = c; k2.nscale8_video(80);
+        nblend(*virtualLeds[sx][sy], k0, 200);
+        if (sx > 0)                             nblend(*virtualLeds[sx-1][sy], k1, 96);
+        if (sx < NUM_VIRTUAL_STRIPS-1)          nblend(*virtualLeds[sx+1][sy], k1, 96);
+        if (sy > 0)                             nblend(*virtualLeds[sx][sy-1], k1, 96);
+        if (sy < LEDS_PER_VIRTUAL_STRIP-1)      nblend(*virtualLeds[sx][sy+1], k1, 96);
+        if (sx > 0 && sy > 0)                                      nblend(*virtualLeds[sx-1][sy-1], k2, 64);
+        if (sx < NUM_VIRTUAL_STRIPS-1 && sy > 0)                   nblend(*virtualLeds[sx+1][sy-1], k2, 64);
+        if (sx > 0 && sy < LEDS_PER_VIRTUAL_STRIP-1)               nblend(*virtualLeds[sx-1][sy+1], k2, 64);
+        if (sx < NUM_VIRTUAL_STRIPS-1 && sy < LEDS_PER_VIRTUAL_STRIP-1) nblend(*virtualLeds[sx+1][sy+1], k2, 64);
+    }
+}
+
+// Clustered spark bursts for M7: short dense sparkle bursts on vocal-range peaks
+static void overlayClusterSparklesM7() {
+    static const int MAX_SPARKS = 160;
+    static int sxBuf[160];
+    static int syBuf[160];
+    static uint8_t lifeBuf[160];
+    static int cx, cy;
+    static uint8_t burstFrames = 0;          // frames left in current burst
+    static unsigned long lastBurstMs = 0;    // cooldown tracking
+    static uint8_t burstStrength = 0;        // 0-255, how strong the trigger was
+
+    // --- Decay existing sparks (always, even between bursts) ---
+    for (int i = 0; i < MAX_SPARKS; i++) {
+        if (!lifeBuf[i]) continue;
+        int sx = sxBuf[i];
+        int sy = syBuf[i];
+        if (sx >= 0 && sx < NUM_VIRTUAL_STRIPS && sy >= 0 && sy < LEDS_PER_VIRTUAL_STRIP) {
+            uint8_t v = (uint8_t)(burstStrength >= 128 ? 140 + lifeBuf[i] * 28 : 90 + lifeBuf[i] * 40);
+            CRGB spark = CRGB(v, v, v);
+            *virtualLeds[sx][sy] += spark;  // additive blend - visible over aurora
+        }
+        lifeBuf[i]--;
+    }
+
+    // --- Peak detection in vocal bands 2-7 (male+female fundamentals+harmonics) ---
+    uint8_t maxDelta = 0;
+    int     maxBand  = 4;
+    for (int b = 2; b <= 7; b++) {
+        if (bandDelta8[b] > maxDelta) {
+            maxDelta = bandDelta8[b];
+            maxBand  = b;
+        }
+    }
+
+    // Real onset: require meaningful transient, not background noise
+    // bandDelta8 range: 0-255, need a real jump (>30) for a burst
+    bool onset = false;
+    uint8_t strength = 0;
+    if (maxDelta > 30) {
+        onset = true;
+        strength = maxDelta;
+    } else if (vocalSyllable && vocalEnv > 60) {
+        onset = true;
+        strength = vocalEnv;
+    } else if (spectralFlux8 > 40 && maxDelta > 15) {
+        onset = true;
+        strength = (spectralFlux8 + maxDelta) / 2;
+    }
+
+    // --- Cooldown: minimum 120ms between bursts ---
+    unsigned long now = millis();
+    if (onset && burstFrames == 0 && (now - lastBurstMs) > 120) {
+        lastBurstMs = now;
+        burstStrength = strength;
+
+        // Place cluster center: map band to strip position with jitter
+        cx = (maxBand * (NUM_VIRTUAL_STRIPS - 1)) / 11 + (int)((int8_t)random8(5) - 2);
+        cx = constrain(cx, 0, NUM_VIRTUAL_STRIPS - 1);
+        cy = random16(LEDS_PER_VIRTUAL_STRIP);
+
+        // Fixed-duration burst: 5-10 frames (~80-170ms), NO top-up
+        burstFrames = 5 + (strength > 150 ? 5 : (strength > 80 ? 3 : 1));
+
+        // Clear old sparks for fresh burst
+        for (int i = 0; i < MAX_SPARKS; i++) lifeBuf[i] = 0;
+    }
+
+    if (!burstFrames) return;
+
+    // --- Emit sparks: count and radius scale with peak strength ---
+    // strength 30-255 maps to 10-45 sparks per frame
+    uint8_t emitCount = 10 + ((uint16_t)burstStrength * 35) / 255 + random8(6);
+    // Tight cluster radius: 5-12 pixels (dense, not spread)
+    float baseR = 5.0f + (burstStrength / 255.0f) * 7.0f;
+
+    for (int e = 0; e < emitCount; e++) {
+        int slot = -1;
+        for (int i = 0; i < MAX_SPARKS; i++) {
+            if (lifeBuf[i] == 0) { slot = i; break; }
+        }
+        if (slot < 0) break;
+        float ang = (random16() / 65535.0f) * TWO_PI;
+        float r   = baseR * (0.3f + (random8() / 255.0f) * 0.7f);  // 30-100% of baseR
+        sxBuf[slot] = (int)lroundf(cx + cosf(ang) * r);
+        syBuf[slot] = (int)lroundf(cy + sinf(ang) * r);
+        lifeBuf[slot] = 4 + random8(4); // 4-7 frame lifespan
+    }
+
+    burstFrames--;
+}
+
+
+
 static void renderMusicVisualization() {
+    static int lastViz = -1;
     int viz = state.pattern;
+    bool reset = (viz != lastViz);
+    lastViz = viz;
 
     switch (viz) {
         case 0:
@@ -828,14 +940,15 @@ static void renderMusicVisualization() {
             renderEQFire();
             break;
         case 7:
-            AuroraOrganic_Run(false);
-            break;
-        case 8:
-            // Fire2012 with audio-driven sparks
-            Fire2012WithAudioEnhanced();
+            // Aurora over clouds with clustered spark bursts on vocal onsets
+            CloudParallax_Pattern(reset);
+            AuroraOnCloud_Run(reset);
+            overlayClusterSparklesM7();
+            FastLED.show();
             break;
         case 9:
-            AuroraNoteSparks_Run(false);
+            // Aurora (note sparks) original behavior
+            AuroraNoteSparks_Run(reset);
             break;
         case 10:
             // Meteorite Rain (sound-reactive peak echoes)
@@ -844,6 +957,14 @@ static void renderMusicVisualization() {
         case 11:
             // Red Comet with Audio (music visualization)
             RedCometWithAudio1();
+            break;
+        case 12:
+            // New hybrid: Cloud background (Pattern 8) + AuroraOrganic foreground
+            CloudParallax_Pattern(reset);   // draw ambient clouds (animated every frame)
+            AuroraOnCloud_Run(reset);       // music-reactive blobs/sparks, no background overwrite
+            // Vocal-color sparkles overlay
+            overlayVocalSparkles();
+            FastLED.show();                 // show once
             break;
         default:
             renderEQBarsBasic();

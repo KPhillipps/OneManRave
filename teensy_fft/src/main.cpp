@@ -69,12 +69,14 @@ const int MAX_BANDS = 12;
 // Display settings
 const float smoothingFactor = 0.15;
 const float FFT_CAL_GAIN = 8000.0f;
+const bool PRINT_NOTES_ONLY = true;
 const float bandTilt12[BANDS_12] = {
     1.0f, 1.0f, 1.05f, 1.1f, 1.15f, 1.2f,
     1.3f, 1.4f, 1.5f, 1.7f, 1.85f, 2.0f};
 
-// FFT bin frequency (Hz per bin at 44.1k / 1024)
-const float BIN_FREQ_HZ = 44100.0f / 1024.0f;
+// FFT bin frequency (Hz per bin), updated from SPDIF sample rate
+static uint32_t spdifSampleRate = 44100;
+static float binFreqHz = 44100.0f / 1024.0f;
 const int PEAK_BIN_START = 2;    // ~86 Hz
 const int PEAK_BIN_END = 255;    // ~11 kHz
 const float PEAK_MAG_LOG_K = 60.0f;
@@ -132,6 +134,12 @@ const int HPS_HARMONICS = 4;    // Multiply fundamental * 2x * 3x * 4x
 const float HPS_MIN_PEAK = 0.00001f;       // Minimum HPS product to consider valid
 const float HPS_PEAK_RATIO_THRESH = 1.8f;  // Peak must be this × the average HPS
 const float HPS_SMOOTH_FACTOR = 0.4f;      // Smooth HPS across frames (higher = more smoothing)
+const uint32_t NOTE_HOLD_MS = 300;         // Hold last strong note briefly when confidence drops
+
+// Key estimation (histogram) settings
+const uint32_t KEY_HISTORY_MS = 30000;   // 30 second history
+const uint32_t KEY_RECALC_MS = 1000;     // recompute every 1 second
+const uint16_t KEY_HISTORY_MAX = 2048;   // capacity for recent pitch samples
 
 // HPS state
 float hpsSmoothed[HPS_BIN_END + 1];         // Smoothed HPS per bin (init in setup)
@@ -141,6 +149,22 @@ float hpsPitchClass[NUM_PITCH_CLASSES];     // HPS energy per pitch class (init 
 uint8_t dominantPitch = 255;           // 0-11 = pitch class, 255 = none
 uint8_t dominantPitchStrength = 0;     // Confidence of dominant pitch (0-255)
 uint16_t dominantPitchHz = 0;          // Detected fundamental frequency in Hz
+static uint8_t lastStablePitch = 255;
+static uint16_t lastStableHz = 0;
+static uint8_t lastStableStrength = 0;
+static uint32_t lastStableMs = 0;
+
+// Key estimation state
+static uint8_t keyHistPitch[KEY_HISTORY_MAX] = {0};
+static uint32_t keyHistTime[KEY_HISTORY_MAX] = {0};
+static uint16_t keyHistCount[NUM_PITCH_CLASSES] = {0};
+static uint16_t keyHistSize = 0;
+static uint16_t keyHistHead = 0;
+static uint16_t keyHistTail = 0;
+static uint16_t keyHistTotal = 0;
+static uint32_t lastKeyCalcMs = 0;
+static uint8_t currentKey = 255;  // 0-11
+static uint8_t currentMode = 0;   // 0=major, 1=minor
 
 // ============================================================================
 // VOCAL ENVELOPE + SYLLABLE DETECTION (vocal-focused energy + transient gating)
@@ -181,7 +205,6 @@ static uint8_t sustainStableCount = 0;
 int8_t binToPitchClass[HPS_BIN_END + 1];
 
 void initPitchMapping() {
-    const float binFreqHz = 44100.0f / 1024.0f;  // ~43.07 Hz per bin
     const float C0 = 16.3516f;
 
     for (int bin = 0; bin <= HPS_BIN_END; bin++) {
@@ -194,6 +217,119 @@ void initPitchMapping() {
         int pitchClass = ((int)roundf(semitones)) % 12;
         if (pitchClass < 0) pitchClass += 12;
         binToPitchClass[bin] = pitchClass;
+    }
+}
+
+static uint8_t pitchClassFromHz(float freqHz) {
+    if (freqHz <= 0.0f) return 0;
+    const float C0 = 16.3516f;
+    float semitones = 12.0f * log2f(freqHz / C0);
+    int pitchClass = ((int)roundf(semitones)) % 12;
+    if (pitchClass < 0) pitchClass += 12;
+    return static_cast<uint8_t>(pitchClass);
+}
+
+static void updateSpdifSampleRate() {
+    unsigned int rate = AudioInputSPDIF3::sampleRate();
+    if (rate > 0 && rate != spdifSampleRate) {
+        spdifSampleRate = rate;
+        binFreqHz = static_cast<float>(spdifSampleRate) / 1024.0f;
+        initPitchMapping();
+    }
+}
+
+static void keyHistoryPrune(uint32_t now) {
+    while (keyHistSize > 0) {
+        uint32_t age = now - keyHistTime[keyHistTail];
+        if (age <= KEY_HISTORY_MS) break;
+        uint8_t oldPitch = keyHistPitch[keyHistTail];
+        if (oldPitch < NUM_PITCH_CLASSES && keyHistCount[oldPitch] > 0) {
+            keyHistCount[oldPitch]--;
+            if (keyHistTotal > 0) keyHistTotal--;
+        }
+        keyHistTail = (keyHistTail + 1) % KEY_HISTORY_MAX;
+        keyHistSize--;
+    }
+}
+
+static void keyHistoryAdd(uint8_t pitch, uint32_t now) {
+    if (keyHistSize == KEY_HISTORY_MAX) {
+        uint8_t oldPitch = keyHistPitch[keyHistTail];
+        if (oldPitch < NUM_PITCH_CLASSES && keyHistCount[oldPitch] > 0) {
+            keyHistCount[oldPitch]--;
+            if (keyHistTotal > 0) keyHistTotal--;
+        }
+        keyHistTail = (keyHistTail + 1) % KEY_HISTORY_MAX;
+        keyHistSize--;
+    }
+
+    keyHistPitch[keyHistHead] = pitch;
+    keyHistTime[keyHistHead] = now;
+    keyHistHead = (keyHistHead + 1) % KEY_HISTORY_MAX;
+    keyHistSize++;
+
+    if (pitch < NUM_PITCH_CLASSES) {
+        keyHistCount[pitch]++;
+        keyHistTotal++;
+    }
+}
+
+static void recalcKeyIfDue(uint32_t now) {
+    if ((now - lastKeyCalcMs) < KEY_RECALC_MS) return;
+    lastKeyCalcMs = now;
+
+    keyHistoryPrune(now);
+    if (keyHistTotal == 0) {
+        currentKey = 255;
+        currentMode = 0;
+        if (Serial && !PRINT_NOTES_ONLY) {
+            Serial.println("[KEY] --");
+        }
+        return;
+    }
+
+    static const int majorScale[7] = {0, 2, 4, 5, 7, 9, 11};
+    static const int minorScale[7] = {0, 2, 3, 5, 7, 8, 10};
+
+    int bestKey = 0;
+    int bestMode = 0;
+    float bestScore = -1e9f;
+
+    for (int root = 0; root < 12; root++) {
+        int inMajor = 0;
+        int inMinor = 0;
+        for (int i = 0; i < 7; i++) {
+            inMajor += keyHistCount[(root + majorScale[i]) % 12];
+            inMinor += keyHistCount[(root + minorScale[i]) % 12];
+        }
+
+        int outMajor = (int)keyHistTotal - inMajor;
+        int outMinor = (int)keyHistTotal - inMinor;
+        float scoreMajor = (float)inMajor - 0.5f * (float)outMajor;
+        float scoreMinor = (float)inMinor - 0.5f * (float)outMinor;
+
+        if (scoreMajor > bestScore) {
+            bestScore = scoreMajor;
+            bestKey = root;
+            bestMode = 0;
+        }
+        if (scoreMinor > bestScore) {
+            bestScore = scoreMinor;
+            bestKey = root;
+            bestMode = 1;
+        }
+    }
+
+    currentKey = static_cast<uint8_t>(bestKey);
+    currentMode = static_cast<uint8_t>(bestMode);
+
+    if (Serial && !PRINT_NOTES_ONLY) {
+        Serial.print("[KEY] ");
+        Serial.print(pitchNames[currentKey]);
+        Serial.print(currentMode == 0 ? "maj" : "min");
+        Serial.print(" total=");
+        Serial.print(keyHistTotal);
+        Serial.println();
     }
 }
 
@@ -244,7 +380,7 @@ void calculatePitch() {
     float peakRatio = (avgHps > 1e-7f) ? (peakVal / avgHps) : 0.0f;
 
     // Debug every frame — scan full FFT for peak magnitude
-    if (Serial) {
+    if (Serial && !PRINT_NOTES_ONLY) {
         float fftPeakMag = 0.0f;
         int fftPeakBin = 0;
         for (int b = 1; b <= 511; b++) {
@@ -256,7 +392,7 @@ void calculatePitch() {
         Serial.print("@");
         Serial.print(fftPeakBin);
         Serial.print("(");
-        Serial.print((int)(fftPeakBin * 43.07f));
+        Serial.print((int)(fftPeakBin * binFreqHz));
         Serial.print("Hz) hpsPk=");
         Serial.print(peakVal, 5);
         Serial.print(" avg=");
@@ -270,31 +406,53 @@ void calculatePitch() {
         Serial.println();
     }
 
-    // Gate: only report when vocal envelope is active and peak stands out
+    // Gate: only report confidence when vocal envelope is active and peak stands out
     bool pitchValid = (peakVal > 1e-5f && peakRatio > HPS_PEAK_RATIO_THRESH &&
                        vocalEnvSmoothed > 0.05f);
 
-    if (pitchValid) {
-        float refinedBin = (float)peakBin;
-        if (peakBin > HPS_BIN_START && peakBin < HPS_BIN_END) {
-            float alpha = hpsSmoothed[peakBin - 1];
-            float beta  = hpsSmoothed[peakBin];
-            float gamma = hpsSmoothed[peakBin + 1];
-            float denom = alpha - 2.0f * beta + gamma;
-            if (fabsf(denom) > 1.0e-12f) {
-                refinedBin += 0.5f * (alpha - gamma) / denom;
-            }
+    float refinedBin = (float)peakBin;
+    if (peakBin > HPS_BIN_START && peakBin < HPS_BIN_END) {
+        float alpha = hpsSmoothed[peakBin - 1];
+        float beta  = hpsSmoothed[peakBin];
+        float gamma = hpsSmoothed[peakBin + 1];
+        float denom = alpha - 2.0f * beta + gamma;
+        if (fabsf(denom) > 1.0e-12f) {
+            refinedBin += 0.5f * (alpha - gamma) / denom;
         }
-
-        float freqHz = refinedBin * (44100.0f / 1024.0f);
-        dominantPitchHz = (uint16_t)(freqHz + 0.5f);
-        dominantPitch = binToPitchClass[peakBin];
-        dominantPitchStrength = min(255, (int)((peakRatio - 1.0f) * 50.0f));
-    } else {
-        dominantPitch = 255;
-        dominantPitchStrength = 0;
-        dominantPitchHz = 0;
     }
+
+    float freqHz = refinedBin * binFreqHz;
+    uint16_t rawHz = (uint16_t)(freqHz + 0.5f);
+    uint8_t rawPitch = pitchClassFromHz(freqHz);
+    int strength = (int)((peakRatio - 1.0f) * 50.0f);
+    if (strength < 0) strength = 0;
+    if (strength > 255) strength = 255;
+
+    uint32_t now = millis();
+    if (pitchValid) {
+        lastStablePitch = rawPitch;
+        lastStableHz = rawHz;
+        lastStableStrength = (uint8_t)strength;
+        lastStableMs = now;
+    }
+
+    bool useHold = (!pitchValid && lastStablePitch < 12 &&
+                    (now - lastStableMs) <= NOTE_HOLD_MS);
+
+    if (useHold) {
+        dominantPitch = lastStablePitch;
+        dominantPitchHz = lastStableHz;
+        dominantPitchStrength = 0;
+    } else {
+        dominantPitch = rawPitch;
+        dominantPitchHz = rawHz;
+        dominantPitchStrength = pitchValid ? (uint8_t)strength : 0;
+    }
+
+    if (pitchValid && rawPitch < 12) {
+        keyHistoryAdd(rawPitch, now);
+    }
+    recalcKeyIfDue(now);
 
     if (Serial) {
         Serial.print("[NOTE] ");
@@ -440,7 +598,7 @@ static void calculatePeakData() {
         refinedBin += delta;
     }
 
-    float hz = refinedBin * BIN_FREQ_HZ;
+    float hz = refinedBin * binFreqHz;
     if (hz < 0.0f) hz = 0.0f;
     if (hz > 22050.0f) hz = 22050.0f;
     majorPeakHz = (uint16_t)(hz + 0.5f);
@@ -743,7 +901,9 @@ void forwardESP32Commands() {
         len--;
     }
 
-    Serial.printf("[CMD] Received: '%s'\n", command);
+    if (Serial && !PRINT_NOTES_ONLY) {
+        Serial.printf("[CMD] Received: '%s'\n", command);
+    }
 
     // Parse and forward mode commands
     uint8_t payload[Proto::CMD_PAYLOAD_LEN] = {0};
@@ -793,7 +953,7 @@ void forwardESP32Commands() {
         Serial2.write(frame, frameLen);
     }
 
-    if (Serial) {
+    if (Serial && !PRINT_NOTES_ONLY) {
         Serial.printf("Mode: %c, Pattern: %d, Brightness: %d, Bands: %d\n", mode, pattern, brightness, BANDS_12);
     }
 }
@@ -816,16 +976,18 @@ void setup() {
         activeChannelLabel = "LEFT (ch0) [DEFAULT]";
     }
 
-    Serial.println("\n=== Teensy FFT Bridge ===");
-    Serial.print("Serial#: ");
-    Serial.println(usb_string_serial_number);
-    Serial.print("SPDIF Channel: ");
-    Serial.println(activeChannelLabel);
-    Serial.print("Firmware: teensy_fft | Built: ");
-    Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
-    Serial.println("Beat detection: DISABLED (vocal envelope only)");
-    Serial.println("Pitch detection: LOCAL (chroma + dominant pitch)");
-    Serial.println("========================================\n");
+    if (Serial && !PRINT_NOTES_ONLY) {
+        Serial.println("\n=== Teensy FFT Bridge ===");
+        Serial.print("Serial#: ");
+        Serial.println(usb_string_serial_number);
+        Serial.print("SPDIF Channel: ");
+        Serial.println(activeChannelLabel);
+        Serial.print("Firmware: teensy_fft | Built: ");
+        Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
+        Serial.println("Beat detection: DISABLED (vocal envelope only)");
+        Serial.println("Pitch detection: LOCAL (chroma + dominant pitch)");
+        Serial.println("========================================\n");
+    }
 
     // Initialize chord detection lookup table
     initPitchMapping();
@@ -855,6 +1017,8 @@ void loop() {
     unsigned long now = millis();
     uint32_t loopStartMicros = micros();
 
+    updateSpdifSampleRate();
+
     // Forward ESP32 commands to LED Teensy
     forwardESP32Commands();
 
@@ -868,7 +1032,7 @@ void loop() {
     }
 
     // Status output every 5 seconds
-    if (Serial && now - lastStatusTime >= STATUS_INTERVAL_MS) {
+    if (Serial && !PRINT_NOTES_ONLY && now - lastStatusTime >= STATUS_INTERVAL_MS) {
         lastStatusTime = now;
         uint32_t intervalMicros = micros() - cpuIntervalStartMicros;
         float avgCpuPct = 0.0f;
@@ -880,6 +1044,8 @@ void loop() {
         }
         Serial.print("FFT SPDIF:");
         Serial.print(spdifInput.pllLocked() ? "LOCK" : "NOLOCK");
+        Serial.print(" SR:");
+        Serial.print(spdifSampleRate);
         // HPS pitch info
         Serial.print(" Note:");
         if (dominantPitch < 12) {

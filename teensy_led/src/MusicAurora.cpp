@@ -48,7 +48,7 @@ static constexpr uint8_t  SPARK_LIFE_MIN  = 10;
 static constexpr uint8_t  SPARK_LIFE_MAX  = 30;
 static constexpr float    SPARK_SPEED_MIN = 0.6f;
 static constexpr float    SPARK_SPEED_MAX = 1.5f;
-static constexpr uint8_t  SPARK_TRAIL     = 180;
+static constexpr uint8_t  SPARK_TRAIL     = 120;
 static constexpr uint8_t  VOCAL_LOW_BAND  = 3;
 static constexpr uint8_t  VOCAL_HIGH_BAND = 7;
 
@@ -81,6 +81,8 @@ struct AState {
   float energy[12] = {0};
   float prevBand[12] = {0};
   uint8_t peakCD[12] = {0};
+  uint8_t clusterCD[12] = {0};  // per-band spark cluster cooldown
+  bool didSpawnThisFrame = false;
   bool peakFlag[12] = {0};
   BlobParticle blobs[MAX_BLOBS];
   SparkParticle sparks[MAX_SPARKS];
@@ -148,27 +150,44 @@ static void spawnBlobs(int band, float energy, int bands) {
 // Spawn sparkles on vocal peaks (bands 3–7) in upper/center area
 static void spawnSparkles() {
   bool auxFresh = (lastAuxPacketMs != 0) && (millis() - lastAuxPacketMs < 200);
-  // derive vocal peak gate strictly from peaks to keep sync
-  bool vocalPeak = false;
+  bool anyPeak = false;
   for (int b = VOCAL_LOW_BAND; b <= VOCAL_HIGH_BAND; b++) {
-    if (S.peakFlag[b] || (auxFresh && bandDelta8[b] > 45)) { vocalPeak = true; break; }
+    if (S.peakFlag[b] || (auxFresh && bandDelta8[b] > 45)) { anyPeak = true; break; }
   }
-  if (!vocalPeak && !peakDetected) return;
+  if (!anyPeak && !peakDetected) return;
 
-  int count = 1 + random8(0, 4); // a few sparks per peak
-  for (int i = 0; i < count; i++) {
-    SparkParticle* s = nullptr;
-    for (auto &sp : S.sparks) { if (!sp.active) { s = &sp; break; } }
-    if (!s) break;
-    s->active = true;
-    s->x = 3.5f + frand() * 5.0f;                     // columns ~3–8
-    s->y = 60.0f + frand() * 84.0f;                   // upper 60%
-    float ang = (frand() - 0.5f) * PI / 3.0f;         // mostly vertical
-    float spd = SPARK_SPEED_MIN + frand() * (SPARK_SPEED_MAX - SPARK_SPEED_MIN);
-    s->vx = cosf(ang) * spd * 0.3f;
-    s->vy = -fabsf(sinf(ang) * spd);                  // slight upward or downward; negative = down
-    s->life = random(SPARK_LIFE_MIN, SPARK_LIFE_MAX);
-    s->hue = 128 + random8(32);                       // cyan/white bias
+  int bands = currentBandCount > 0 ? currentBandCount : 12;
+  for (int b = VOCAL_LOW_BAND; b <= VOCAL_HIGH_BAND; b++) {
+    bool peaked = S.peakFlag[b] || (auxFresh && bandDelta8[b] > 45);
+    if (!peaked) continue;
+    if (S.didSpawnThisFrame) return;   // only one cluster spawner per frame
+    if (S.clusterCD[b]) continue;      // per-band cooldown
+    S.clusterCD[b] = 6;                // cooldown frames
+    S.didSpawnThisFrame = true;
+
+    float cx = bandToX(b, bands);
+    float cy = (LEDS_PER_VIRTUAL_STRIP-1) * 0.5f;
+    int count = 12 + random8(8); // 12..19 denser cluster
+    for (int i = 0; i < count; i++) {
+      SparkParticle* s = nullptr;
+      for (auto &sp : S.sparks) { if (!sp.active) { s = &sp; break; } }
+      if (!s) break;
+      s->active = true;
+      // Tight jitter; fill cluster
+      s->x = cx + (frand()-0.5f) * (NUM_VIRTUAL_STRIPS * 0.15f);
+      s->y = cy + (frand()-0.5f) * (LEDS_PER_VIRTUAL_STRIP * 0.20f);
+      float ang = frand() * TWO_PI;                      // 360°
+      float spd = 0.30f + frand() * 0.50f;               // modest speed
+      const float ASPECT_X = 0.12f;                      // reduce horizontal smear
+      const float ASPECT_Y = 0.50f;                      // reduce vertical speed to stay proximate
+      float r0 = 0.2f + frand()*0.4f;                    // initial radial fill
+      s->x += cosf(ang) * r0;
+      s->y += sinf(ang) * r0;
+      s->vx = cosf(ang) * spd * ASPECT_X;
+      s->vy = sinf(ang) * spd * ASPECT_Y;
+      s->life = random(SPARK_LIFE_MIN, SPARK_LIFE_MAX);
+      s->hue = 128 + random8(32);
+    }
   }
 }
 
@@ -235,11 +254,21 @@ static void renderSparks() {
     int x = (int)lroundf(s.x);
     int y = (int)lroundf(s.y);
     if (x < 0 || x >= NUM_VIRTUAL_STRIPS || y < 0 || y >= LEDS_PER_VIRTUAL_STRIP) continue;
-    CRGB c = CHSV(s.hue, 80, 255);     // bright cyan/white
-    P(x, y) += c;                      // additive
-    if (x > 0) P(x-1, y).fadeToBlackBy(255 - SPARK_TRAIL), P(x-1, y) += c;
-    if (x < NUM_VIRTUAL_STRIPS-1) P(x+1, y).fadeToBlackBy(255 - SPARK_TRAIL), P(x+1, y) += c;
-    if (y < LEDS_PER_VIRTUAL_STRIP-1) P(x, y+1).fadeToBlackBy(255 - SPARK_TRAIL), P(x, y+1) += c;
+
+    CRGB c  = CHSV(s.hue, 200, 255);        // colored + bright
+    CRGB k0 = c;                            // center
+    CRGB k1 = c; k1.nscale8_video(160);     // cardinals
+    CRGB k2 = c; k2.nscale8_video(80);      // diagonals
+
+    nblend(P(x, y), k0, 200);
+    if (x > 0)                             nblend(P(x-1, y), k1, 96);
+    if (x < NUM_VIRTUAL_STRIPS-1)          nblend(P(x+1, y), k1, 96);
+    if (y > 0)                             nblend(P(x, y-1), k1, 96);
+    if (y < LEDS_PER_VIRTUAL_STRIP-1)      nblend(P(x, y+1), k1, 96);
+    if (x > 0 && y > 0)                                      nblend(P(x-1, y-1), k2, 64);
+    if (x < NUM_VIRTUAL_STRIPS-1 && y > 0)                   nblend(P(x+1, y-1), k2, 64);
+    if (x > 0 && y < LEDS_PER_VIRTUAL_STRIP-1)               nblend(P(x-1, y+1), k2, 64);
+    if (x < NUM_VIRTUAL_STRIPS-1 && y < LEDS_PER_VIRTUAL_STRIP-1) nblend(P(x+1, y+1), k2, 64);
   }
 }
 
@@ -252,6 +281,8 @@ void AuroraOrganic_Run(bool reset) {
 
   // Smooth energy and detect peaks per band
   bool auxFresh = (lastAuxPacketMs != 0) && (millis() - lastAuxPacketMs < 200);
+  S.didSpawnThisFrame = false;
+  for (int i = 0; i < 12; ++i) if (S.clusterCD[i]) S.clusterCD[i]--;
   for (int b = 0; b < 12; b++) {
     float raw = (b < bands) ? bandAmplitude[b] : 0.0f;
     float t = raw * AMP_SCALE;
@@ -283,4 +314,40 @@ void AuroraOrganic_Run(bool reset) {
 void AuroraNoteSparks_Run(bool reset) {
   // Reuse same behavior; palette already cool. Keeping separate entry for pattern map.
   AuroraOrganic_Run(reset);
+}
+
+// Aurora over external background (e.g., clouds) - reuse aurora logic
+void AuroraOnCloud_Run(bool reset) {
+  // Caller is expected to draw background first; we just run the aurora layer.
+  if (reset) S.reset();
+  int bands = currentBandCount > 0 ? currentBandCount : 12;
+
+  bool auxFresh = (lastAuxPacketMs != 0) && (millis() - lastAuxPacketMs < 200);
+  S.didSpawnThisFrame = false;
+  for (int i = 0; i < 12; ++i) if (S.clusterCD[i]) S.clusterCD[i]--;
+
+  for (int b = 0; b < 12; b++) {
+    float raw = (b < bands) ? bandAmplitude[b] : 0.0f;
+    float t = raw * AMP_SCALE;
+    t = constrain(t, 0.0f, 1.0f);
+    float prev = S.energy[b];
+    float a = (t > prev) ? ATTACK : RELEASE;
+    S.energy[b] = prev + (t - prev) * a;
+
+    if (S.peakCD[b] > 0) S.peakCD[b]--;
+    bool isPeak = bandIsPeak(b, S.energy[b]) && (S.peakCD[b] == 0);
+    S.peakFlag[b] = isPeak;
+    if (isPeak) {
+      S.peakCD[b] = 5;  // small refractory
+      spawnBlobs(b, S.energy[b], bands);
+    }
+    S.prevBand[b] = S.energy[b];
+  }
+
+  spawnSparkles();      // vocal-driven
+  // Skip renderBackground here; caller supplies background
+  stepBlobs();
+  renderBlobs();        // dark silhouettes
+  stepSparks();
+  renderSparks();       // additive overlay
 }
