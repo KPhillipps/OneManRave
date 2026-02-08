@@ -495,7 +495,7 @@ static struct {
   uint32_t lastMs = 0;
   Zone zones[20];
   uint8_t zoneCount = ZONES_TOTAL;
-  uint16_t xOff=0, yOff=0, tOff=0; // backfield noise drift
+  float xOffF=0, yOffF=0, tOffF=0; // float accumulators (cast to uint16_t for inoise8)
 } cloudG;
 
 static inline CRGB& cloudP(int x,int y){
@@ -555,22 +555,26 @@ static void cloudReset() {
 }
 
 static void drawBackfield() {
-  cloudG.tOff += 1;
+  uint16_t tI = (uint16_t)cloudG.tOffF;
+  uint16_t xI = (uint16_t)cloudG.xOffF;
+  uint16_t yI = (uint16_t)cloudG.yOffF;
   for (int x=0; x<NUM_VIRTUAL_STRIPS; ++x){
-    uint16_t xo = cloudG.xOff + x*123;
+    uint16_t xo = xI + x*123;
     for (int y=0; y<LEDS_PER_VIRTUAL_STRIP; ++y){
-      uint8_t n = inoise8(xo, cloudG.yOff + y*37, cloudG.tOff);
+      uint8_t n = inoise8(xo, yI + y*37, tI);
       CRGB c = BackfieldColor(scale8(n, 70), (uint8_t)y);
-      // Overwrite backfield each frame for contrast; no persistence
       cloudP(x,y) = c;
     }
   }
 }
 
 static void updateZones(float dt) {
-  uint16_t d = (uint16_t)(dt * 1000.0f);
-  cloudG.xOff += (uint16_t)(d * 0.12f); // faster drift for animation under music viz
-  cloudG.yOff += (uint16_t)(d * 0.06f);
+  // Float accumulators for smooth noise drift (no integer truncation)
+  cloudG.tOffF += dt * 60.0f;          // ~1 per frame at 60fps
+  cloudG.xOffF += dt * 120.0f;         // smooth background scroll
+  cloudG.yOffF += dt * 60.0f;
+
+  uint16_t tI = (uint16_t)cloudG.tOffF; // for noise lookups
 
   for (uint8_t i=0;i<cloudG.zoneCount;i++){
     Zone &q = cloudG.zones[i];
@@ -579,7 +583,6 @@ static void updateZones(float dt) {
     q.cx += q.vx * dt; // px/sec directly in column units
     if (q.cx < -q.rx) {
       q.cx = NUM_VIRTUAL_STRIPS + q.rx;
-      // randomize vertical start and hue to avoid same-origin appearance
       q.cy = random16(q.ry, LEDS_PER_VIRTUAL_STRIP - q.ry) + 0.5f;
       q.hueJ = random8();
       q.nseed = random16();
@@ -593,9 +596,15 @@ static void updateZones(float dt) {
       q.fade = 0.0f;
     }
 
-    uint8_t n = inoise8((uint16_t)(q.nseed + cloudG.tOff*2), (uint16_t)(q.cy*4));
-    float bob = ((int)n - 128) / 128.0f; // -1..1
-    q.cy += bob * 0.14f; // keep some bob but a bit calmer
+    // Vertical bob: use noise as a POSITION OFFSET, not velocity.
+    // This gives smooth sinusoidal drift instead of accumulated jitter.
+    uint8_t n = inoise8((uint16_t)(q.nseed + tI * 2), (uint16_t)(q.nseed * 3));
+    float bobTarget = ((int)n - 128) / 128.0f; // -1..1
+    float bobOffset = bobTarget * 6.0f;         // ±6 pixels of gentle drift
+    // Smooth toward target (low-pass filter prevents sudden jumps)
+    float cyBase = q.cy - q.vy;  // remove old bob to get base position
+    q.vy += (bobOffset - q.vy) * 0.02f;  // exponential smooth, very gradual
+    q.cy = cyBase + q.vy;
     if (q.cy < q.ry) q.cy = q.ry;
     if (q.cy > (LEDS_PER_VIRTUAL_STRIP-1 - q.ry)) q.cy = (LEDS_PER_VIRTUAL_STRIP-1 - q.ry);
 
@@ -638,7 +647,7 @@ static void drawZones() {
             // Smooth Gaussian-ish falloff; larger blobs get softer edges (wider sigma)
             float softness = 0.55f * (6.0f / max(3.0f, (float)q.rx)); // softer edge
             float base = expf(-d2 * softness);            // ~1 at center
-            uint8_t wn = inoise8((uint16_t)(x*37 + q.nseed), (uint16_t)(y*29 + q.nseed), cloudG.tOff);
+            uint8_t wn = inoise8((uint16_t)(x*37 + q.nseed), (uint16_t)(y*29 + q.nseed), (uint16_t)cloudG.tOffF);
             float wobble = ((int)wn - 128) / 2048.0f;   // subtle texture, not pop
             float alphaF = constrain(base + wobble, 0.10f, 1.0f); // lighter minimum rim, wider visible body
             alphaF *= q.fade; // fade-in multiplier
@@ -666,7 +675,7 @@ void CloudParallax_Pattern(bool reset){
 
   uint32_t now = millis();
   float dt = (cloudG.lastMs==0) ? 0.016f : (now - cloudG.lastMs)/1000.0f;
-  if (dt > 0.03f) dt = 0.03f; // smaller step to reduce column jumps
+  if (dt > 0.10f) dt = 0.10f; // only clamp truly stale frames (100ms+), not normal jitter
   cloudG.lastMs = now;
 
   drawBackfield();

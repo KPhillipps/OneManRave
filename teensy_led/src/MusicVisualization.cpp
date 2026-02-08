@@ -783,6 +783,197 @@ static void renderEQFire() {
     FastLED.show();
 }
 
+// ============================================================================
+// WLED-Ported Fire Effects (audio-reactive adaptations)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Noisefire - Perlin noise fire with per-band volume brightness
+// Adapted from WLED (Andrew Tuline). Zero-latency audio response.
+// fireSparking → noise speed, fireCooling → flame taper, fireAudioBoost → sensitivity
+// ----------------------------------------------------------------------------
+static void renderNoiseFire() {
+    static const CRGBPalette16 noisefirePal(
+        CHSV(0,255,2),    CHSV(0,255,4),    CHSV(0,255,8),    CHSV(0,255,8),
+        CHSV(0,255,16),   CRGB::Red,         CRGB::Red,         CRGB::Red,
+        CRGB::DarkOrange,  CRGB::DarkOrange,  CRGB::Orange,      CRGB::Orange,
+        CRGB::Yellow,      CRGB::Orange,      CRGB::Yellow,      CRGB::Yellow);
+
+    const bool auxFresh = (lastAuxPacketMs != 0 && (millis() - lastAuxPacketMs) < 200);
+    const uint32_t now = millis();
+    const uint8_t speed = fireSparking;            // noise animation speed
+    const uint8_t intensity = 255 - fireCooling;   // taper control (high cooling = steep taper)
+
+    for (int strip = 0; strip < NUM_VIRTUAL_STRIPS; strip++) {
+        float vol;
+        if (auxFresh && strip < MAX_BANDS)
+            vol = bandVis8[strip] / 255.0f;
+        else if (strip < MAX_BANDS)
+            vol = bandVis[strip];
+        else
+            vol = 0.0f;
+
+        // Transients add extra punch
+        float delta = (auxFresh && strip < MAX_BANDS) ? (bandDelta8[strip] / 255.0f) : 0.0f;
+        vol += delta * 0.5f;
+        vol *= fireAudioBoost;
+        // *2 brightness like WLED (volumeSmth*2)
+        uint8_t brt = (uint8_t)constrain(vol * 510.0f, 0.0f, 255.0f);
+
+        for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
+            // Perlin noise: position along strip × time, offset per strip
+            uint16_t nx = (uint16_t)(y * speed / 64 + strip * 1000);
+            uint16_t ny = (uint16_t)(now * speed / 64 * LEDS_PER_VIRTUAL_STRIP / 255);
+            unsigned idx = inoise8(nx, ny);
+            // Taper toward top: y=0 (bottom) bright, y=143 (top) dark
+            unsigned taper = 255 - y * 256 / LEDS_PER_VIRTUAL_STRIP;
+            unsigned divisor = 256 - intensity;
+            if (divisor < 1) divisor = 1;
+            idx = taper * idx / divisor;
+
+            *virtualLeds[strip][y] = ColorFromPalette(noisefirePal, idx, brt, LINEARBLEND);
+        }
+    }
+
+    FastLED.show();
+}
+
+// ----------------------------------------------------------------------------
+// Fire 2012 - Classic heat simulation with audio-reactive sparking
+// Adapted from WLED (Mark Kriegsman). Faithful to original algorithm.
+// fireCooling → cooling rate, fireSparking → base spark rate, fireAudioBoost → audio sensitivity
+// ----------------------------------------------------------------------------
+static void renderFire2012() {
+    static uint8_t heat2012[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
+    static uint32_t lastStep = 0;
+    static bool initialized2012 = false;
+
+    if (!initialized2012) {
+        memset(heat2012, 0, sizeof(heat2012));
+        initialized2012 = true;
+    }
+
+    const uint32_t it = millis() >> 5;  // div 32, matches WLED timing
+    const bool newStep = (it != lastStep);
+    const bool auxFresh = (lastAuxPacketMs != 0 && (millis() - lastAuxPacketMs) < 200);
+    const uint8_t ignition = max(3, LEDS_PER_VIRTUAL_STRIP / 10);  // 14 pixels
+
+    for (int strip = 0; strip < NUM_VIRTUAL_STRIPS; strip++) {
+        // Per-band audio
+        float bandLevel = 0.0f;
+        float delta = 0.0f;
+        if (strip < MAX_BANDS) {
+            bandLevel = auxFresh ? (bandVis8[strip] / 255.0f) : bandVis[strip];
+            delta = auxFresh ? (bandDelta8[strip] / 255.0f) : 0.0f;
+        }
+
+        // Audio-modulated spark rate
+        uint8_t sparkRate = fireSparking;
+        sparkRate = qadd8(sparkRate, (uint8_t)constrain(bandLevel * 120.0f * fireAudioBoost, 0.0f, 255.0f));
+        sparkRate = qadd8(sparkRate, (uint8_t)constrain(delta * 200.0f * fireAudioBoost, 0.0f, 255.0f));
+
+        // Cooling from fireCooling (NOT reduced by audio - faithful to WLED)
+        uint8_t cooling = fireCooling;
+
+        // Step 1: Cool down every cell
+        for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
+            uint8_t cool = newStep
+                ? random8((((20 + cooling / 3) * 16) / LEDS_PER_VIRTUAL_STRIP) + 2)
+                : random8(4);
+            // Minimum temp in ignition zone (embers never go black)
+            uint8_t minTemp = (y < ignition) ? (ignition - y) / 4 + 16 : 0;
+            uint8_t temp = qsub8(heat2012[strip][y], cool);
+            heat2012[strip][y] = (temp < minTemp) ? minTemp : temp;
+        }
+
+        if (newStep) {
+            // Step 2: Heat drifts up and diffuses (WLED's exact formula)
+            for (int k = LEDS_PER_VIRTUAL_STRIP - 1; k > 1; k--) {
+                heat2012[strip][k] = (heat2012[strip][k - 1] + (heat2012[strip][k - 2] << 1)) / 3;
+            }
+
+            // Step 3: Randomly ignite sparks (audio-modulated rate)
+            if (random8() <= sparkRate) {
+                uint8_t y = random8(ignition);
+                uint8_t boost = 17 * (ignition - y / 2) / ignition;
+                heat2012[strip][y] = qadd8(heat2012[strip][y], random8(96 + 2 * boost, 207 + boost));
+            }
+
+            // Extra: audio transient burst (not in original WLED, adds reactivity)
+            if (delta > 0.08f) {
+                uint8_t hotness = (uint8_t)constrain(delta * 400.0f * fireAudioBoost, 120.0f, 255.0f);
+                int count = 2 + (int)(delta * 8.0f);
+                if (count > 6) count = 6;
+                for (int i = 0; i < count; i++) {
+                    uint8_t y = random8(ignition);
+                    heat2012[strip][y] = qadd8(heat2012[strip][y], hotness);
+                }
+            }
+        }
+
+        // Step 4: Map heat to fire colors (NOBLEND like WLED)
+        for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; y++) {
+            *virtualLeds[strip][y] = ColorFromPalette(firePalette, min(heat2012[strip][y], (uint8_t)240), 255, NOBLEND);
+        }
+    }
+
+    lastStep = it;
+    FastLED.show();
+}
+
+// ----------------------------------------------------------------------------
+// 2D Firenoise - Perlin noise across full 12x144 matrix with per-band audio
+// Adapted from WLED (Andrew Tuline).
+// fireSparking → Y scale (flame detail), fireCooling → X scale, fireAudioBoost → audio brightness
+// ----------------------------------------------------------------------------
+static void renderFirenoise2D() {
+    static const CRGBPalette16 firenoisePal(
+        CRGB::Black,       CRGB::Black,       CRGB::Black,       CRGB::Black,
+        CRGB::Red,         CRGB::Red,         CRGB::Red,         CRGB::DarkOrange,
+        CRGB::DarkOrange,  CRGB::DarkOrange,  CRGB::Orange,      CRGB::Orange,
+        CRGB::Yellow,      CRGB::Orange,      CRGB::Yellow,      CRGB::Yellow);
+
+    const bool auxFresh = (lastAuxPacketMs != 0 && (millis() - lastAuxPacketMs) < 200);
+    const int cols = NUM_VIRTUAL_STRIPS;    // 12
+    const int rows = LEDS_PER_VIRTUAL_STRIP; // 144
+    const uint32_t now = millis();
+
+    // fireSparking → Y scale, fireCooling → X scale (WLED: intensity*4, speed*8)
+    unsigned xscale = ((unsigned)fireSparking) * 4;
+    unsigned yscale = ((unsigned)(255 - fireCooling)) * 8;
+
+    for (int x = 0; x < cols; x++) {
+        // Per-band brightness modifier
+        float bandLevel = 0.0f;
+        float delta = 0.0f;
+        if (auxFresh && x < MAX_BANDS) {
+            bandLevel = bandVis8[x] / 255.0f;
+            delta = bandDelta8[x] / 255.0f;
+        } else if (x < MAX_BANDS) {
+            bandLevel = bandVis[x];
+        }
+        float colMod = 0.3f + (bandLevel + delta * 0.5f) * 0.7f * fireAudioBoost;
+        if (colMod > 1.5f) colMod = 1.5f;
+
+        for (int y = 0; y < rows; y++) {
+            // Reverse row index: y=0 (bottom) → ri=143 (hot), y=143 (top) → ri=0 (dark)
+            int ri = rows - 1 - y;
+
+            uint16_t nx = (uint16_t)(x * yscale * rows / 255);
+            uint16_t ny = (uint16_t)(ri * xscale + now / 4);
+            unsigned indexx = inoise8(nx, ny);
+
+            uint8_t palIdx = (uint8_t)min((unsigned)(ri * indexx / 11), 225U);
+            unsigned brtCalc = (unsigned)((float)(ri * 255 / rows) * colMod);
+            if (brtCalc > 255) brtCalc = 255;
+
+            *virtualLeds[x][y] = ColorFromPalette(firenoisePal, palIdx, (uint8_t)brtCalc, LINEARBLEND);
+        }
+    }
+
+    FastLED.show();
+}
+
 // Simple sparkle overlay driven by vocal energy and note
 static void overlayVocalSparkles() {
     // Onset: vocal syllable or strong delta in vocal bands
@@ -958,6 +1149,10 @@ static void renderMusicVisualization() {
             // Red Comet with Audio (music visualization)
             RedCometWithAudio1();
             break;
+        case 8:
+            // WLED Noisefire: Perlin noise fire, per-band volume brightness
+            renderNoiseFire();
+            break;
         case 12:
             // New hybrid: Cloud background (Pattern 8) + AuroraOrganic foreground
             CloudParallax_Pattern(reset);   // draw ambient clouds (animated every frame)
@@ -965,6 +1160,14 @@ static void renderMusicVisualization() {
             // Vocal-color sparkles overlay
             overlayVocalSparkles();
             FastLED.show();                 // show once
+            break;
+        case 13:
+            // WLED Fire 2012: Classic heat sim with audio-reactive sparking
+            renderFire2012();
+            break;
+        case 14:
+            // WLED 2D Firenoise: Perlin noise across 12x144 matrix
+            renderFirenoise2D();
             break;
         default:
             renderEQBarsBasic();
