@@ -24,6 +24,8 @@ static inline bool patternDelay(uint16_t ms) {
     return responsiveDelay(ms);
 }
 
+// NOTE: All P-mode patterns are non-reactive. No beat, no sound, no audio input.
+// Use blocking loops with patternDelay(). Music reactivity belongs in M-mode only.
 void runPattern() {
   static int lastPattern = -1;
   bool reset = (state.pattern != lastPattern);
@@ -33,12 +35,6 @@ void runPattern() {
   }
   switch (state.pattern) {
     case 0:
-      break;
-
-    case 1:
-      break;
-
-    case 2:
       {                          // Rainbow Pattern with Beat
         static uint8_t hue = 0;  // Global hue, incremented over time
         static float beatFlash = 0.0f;
@@ -87,7 +83,7 @@ void runPattern() {
       }
       break;
 
-    case 3:
+    case 1:
       {  // Rainbow with Sparkle + Beat
         static uint8_t hue = 0;
         static float beatFlash = 0.0f;
@@ -143,7 +139,7 @@ void runPattern() {
       }
       break;
 
-    case 4:
+    case 2:
       {  // Fire Pattern with Beat
 #define COOLING 100
 #define SPARKING 180
@@ -206,7 +202,7 @@ void runPattern() {
       }
       break;
 
-    case 5:
+    case 3:
       {  // Sinelon Pattern with Beat
         static uint16_t position[NUM_VIRTUAL_STRIPS] = { 0 };
         static uint8_t hue[NUM_VIRTUAL_STRIPS] = { 0 };
@@ -265,7 +261,7 @@ void runPattern() {
       break;
 
 
-    case 6:
+    case 4:
       {  // Enhanced Sinelon Pattern with Beat
         static uint16_t position[NUM_VIRTUAL_STRIPS] = { 0 };
         static uint8_t hue[NUM_VIRTUAL_STRIPS] = { 0 };
@@ -329,7 +325,7 @@ void runPattern() {
         }
       }
       break;
-    case 7:
+    case 5:
       {  // Meteor Shower with Beat - non-blocking version
         static int meteorPos[NUM_VIRTUAL_STRIPS];
         static uint8_t meteorHue[NUM_VIRTUAL_STRIPS];
@@ -427,7 +423,7 @@ void runPattern() {
       }
       break;
 
-    case 8:
+    case 6:
       {  // Cloud Parallax ambient pattern (non-music)
         CloudParallax_Pattern(reset);
         FastLED.show();
@@ -482,13 +478,16 @@ enum Layer : uint8_t { FAR=0, MID=1, FORE=2 };
 
 struct Zone {
   float cx, cy;      // center
-  float vx, vy;      // velocity
+  float vx, vy;      // velocity (vy = smoothed bob offset)
+  float vyDrift;     // vertical drift speed (px/sec)
   uint8_t rx, ry;    // radii in px
   uint16_t nseed;    // noise seed for edge wobble
   uint8_t hueJ;      // minor hue jitter
-  float fade;        // 0..1 fade-in factor
+  float fade;        // 0..1 fade-in/out factor
+  float life;        // seconds remaining before dissolution
   Layer layer;
   bool  alive;
+  bool  dissolving;  // true = fading out, respawn when fade <= 0
 };
 
 static struct {
@@ -511,35 +510,41 @@ static int wrapBand(int v, int lo, int hi){
   return v;
 }
 
+static void spawnOneCloud(Zone &q, Layer L) {
+  q.layer = L;
+  q.cx = random8(0, NUM_VIRTUAL_STRIPS-1) + 0.5f;
+  q.cy = random16(20, LEDS_PER_VIRTUAL_STRIP - 20) + 0.5f;
+
+  // ~70% smaller than previous, wide random range for varied shapes
+  uint8_t rxMin=1, rxMax=2, ryMin=3, ryMax=10;
+  if (L == FAR)  { rxMin=1; rxMax=1; ryMin=2; ryMax=8; }
+  if (L == FORE) { rxMin=1; rxMax=3; ryMin=3; ryMax=12; }
+  q.rx = random8(rxMin, rxMax+1);
+  q.ry = random8(ryMin, ryMax+1);
+
+  float base = BASE_DRIFT_PX_S;
+  float f = (L==FAR)? FAR_FACTOR : (L==MID? MID_FACTOR : FORE_FACTOR);
+  // Bidirectional horizontal drift
+  float dir = (random8() & 1) ? 1.0f : -1.0f;
+  q.vx = dir * (base * f) * (0.8f + (random8() / 255.0f) * 0.5f);
+  q.vy = 0.0f;
+  // Vertical drift: random up/down
+  q.vyDrift = (base * f) * 3.0f * ((random8() & 1) ? 1.0f : -1.0f)
+              * (0.8f + (random8() / 255.0f) * 0.4f);
+
+  q.nseed = random16();
+  q.hueJ  = random8();
+  q.fade  = 0.0f;
+  q.life  = 20.0f + (random8() / 255.0f) * 20.0f; // 20-40s lifetime
+  q.alive = true;
+  q.dissolving = false;
+}
+
 static void spawnClouds() {
   uint8_t z = 0;
   auto mk = [&](Layer L, uint8_t count){
     for (uint8_t i=0; i<count && z<cloudG.zoneCount; ++i,++z){
-      Zone &q = cloudG.zones[z];
-      q.layer = L;
-      q.cx = random8(0, NUM_VIRTUAL_STRIPS-1) + 0.5f;
-      q.cy = random16(0, LEDS_PER_VIRTUAL_STRIP-1) + 0.5f;
-
-      // Wider than tall for a more natural cloud perspective
-      uint8_t rxMin=5, rxMax=9, ryMin=8, ryMax=16;   // moderate size, avoid tiny
-      if (L == FAR) { rxMin=5; rxMax=8;  ryMin=8;  ryMax=14; }
-      if (L == FORE){ rxMin=6; rxMax=10; ryMin=9;  ryMax=18; } // slightly larger fore blobs
-      q.rx = random8(rxMin, rxMax+1);
-      // Final clamp to avoid skinny blobs and prevent exceeding panel width
-      if (q.rx < 5) q.rx = 5;
-      if (q.rx > NUM_VIRTUAL_STRIPS-2) q.rx = NUM_VIRTUAL_STRIPS-2;
-      q.ry = random8(ryMin, ryMax+1);
-
-      float base = BASE_DRIFT_PX_S;
-      float f = (L==FAR)? FAR_FACTOR : (L==MID? MID_FACTOR : FORE_FACTOR);
-      // Single direction (left-to-right) for calmer feel; jitter magnitude only
-      q.vx = (base * f) * (0.8f + (random8() / 255.0f) * 0.5f); // 0.8..1.3x
-      q.vy = 0.0f;
-
-      q.nseed = random16();
-      q.hueJ  = random8();
-      q.fade  = 0.0f;
-      q.alive = true;
+      spawnOneCloud(cloudG.zones[z], L);
     }
   };
   mk(FAR,  FAR_ZONES);
@@ -576,43 +581,46 @@ static void updateZones(float dt) {
 
   uint16_t tI = (uint16_t)cloudG.tOffF; // for noise lookups
 
+  static constexpr float DISSOLVE_SEC = 3.0f; // fade-out duration
+
   for (uint8_t i=0;i<cloudG.zoneCount;i++){
     Zone &q = cloudG.zones[i];
     if (!q.alive) continue;
 
-    q.cx += q.vx * dt; // px/sec directly in column units
-    if (q.cx < -q.rx) {
-      q.cx = NUM_VIRTUAL_STRIPS + q.rx;
-      q.cy = random16(q.ry, LEDS_PER_VIRTUAL_STRIP - q.ry) + 0.5f;
-      q.hueJ = random8();
-      q.nseed = random16();
-      q.fade = 0.0f;
-    }
-    if (q.cx > NUM_VIRTUAL_STRIPS + q.rx) {
-      q.cx = -q.rx;
-      q.cy = random16(q.ry, LEDS_PER_VIRTUAL_STRIP - q.ry) + 0.5f;
-      q.hueJ = random8();
-      q.nseed = random16();
-      q.fade = 0.0f;
+    // Drift
+    q.cx += q.vx * dt;
+    q.life -= dt;
+
+    // Trigger dissolution: lifetime expired or drifted off-screen
+    if (!q.dissolving) {
+      bool offScreen = (q.cx < -(float)q.rx - 2) || (q.cx > NUM_VIRTUAL_STRIPS + q.rx + 2)
+                     || (q.cy < -(float)q.ry) || (q.cy > LEDS_PER_VIRTUAL_STRIP + (float)q.ry);
+      if (q.life <= 0.0f || offScreen) {
+        q.dissolving = true;
+      }
     }
 
-    // Vertical bob: use noise as a POSITION OFFSET, not velocity.
-    // This gives smooth sinusoidal drift instead of accumulated jitter.
-    uint8_t n = inoise8((uint16_t)(q.nseed + tI * 2), (uint16_t)(q.nseed * 3));
-    float bobTarget = ((int)n - 128) / 128.0f; // -1..1
-    float bobOffset = bobTarget * 6.0f;         // ±6 pixels of gentle drift
-    // Smooth toward target (low-pass filter prevents sudden jumps)
-    float cyBase = q.cy - q.vy;  // remove old bob to get base position
-    q.vy += (bobOffset - q.vy) * 0.02f;  // exponential smooth, very gradual
-    q.cy = cyBase + q.vy;
-    if (q.cy < q.ry) q.cy = q.ry;
-    if (q.cy > (LEDS_PER_VIRTUAL_STRIP-1 - q.ry)) q.cy = (LEDS_PER_VIRTUAL_STRIP-1 - q.ry);
-
-    // Fade-in ramp
-    if (q.fade < 1.0f) {
+    // Dissolving: fade out gradually, then respawn
+    if (q.dissolving) {
+      q.fade -= dt / DISSOLVE_SEC;
+      if (q.fade <= 0.0f) {
+        spawnOneCloud(q, q.layer);  // respawn as new cloud
+        continue;
+      }
+    } else if (q.fade < 1.0f) {
+      // Fade-in ramp
       q.fade += dt / FADE_IN_SEC;
       if (q.fade > 1.0f) q.fade = 1.0f;
     }
+
+    // Vertical bob: noise-driven position offset for organic motion
+    uint8_t n = inoise8((uint16_t)(q.nseed + tI * 2), (uint16_t)(q.nseed * 3));
+    float bobTarget = ((int)n - 128) / 128.0f; // -1..1
+    float bobOffset = bobTarget * 18.0f;        // ±18 pixels of gentle drift
+    float cyBase = q.cy - q.vy;  // remove old bob to get base position
+    cyBase += q.vyDrift * dt;    // vertical drift
+    q.vy += (bobOffset - q.vy) * 0.02f;  // exponential smooth
+    q.cy = cyBase + q.vy;
   }
 }
 
@@ -621,12 +629,10 @@ static void drawZones() {
     for (uint8_t i=0;i<cloudG.zoneCount;i++){
       Zone &q = cloudG.zones[i];
       if (!q.alive || (uint8_t)q.layer != pass) continue;
+      if (q.fade <= 0.0f) continue;
 
-      // Skip very narrow blobs (belt-and-suspenders)
-      if (q.rx < 6 || q.ry < 6) continue;
-
-      int xmin = (int)floorf(q.cx - q.rx - 1);
-      int xmax = (int)ceilf(q.cx + q.rx + 1);
+      int xmin = (int)floorf(q.cx - q.rx - 2);
+      int xmax = (int)ceilf(q.cx + q.rx + 2);
       int ymin = (int)floorf(q.cy - q.ry - 1);
       int ymax = (int)ceilf(q.cy + q.ry + 1);
       xmin = wrapBand(xmin, 0, NUM_VIRTUAL_STRIPS-1);
@@ -642,19 +648,34 @@ static void drawZones() {
             float dx = dxRaw / (float)q.rx;
             float dy = (y - q.cy) / (float)q.ry;
             float d2 = dx*dx + dy*dy;
-            if (d2 > 3.5f) continue; // slightly wider mask; keeps more body
+            if (d2 > 5.0f) continue;
 
-            // Smooth Gaussian-ish falloff; larger blobs get softer edges (wider sigma)
-            float softness = 0.55f * (6.0f / max(3.0f, (float)q.rx)); // softer edge
-            float base = expf(-d2 * softness);            // ~1 at center
-            uint8_t wn = inoise8((uint16_t)(x*37 + q.nseed), (uint16_t)(y*29 + q.nseed), (uint16_t)cloudG.tOffF);
-            float wobble = ((int)wn - 128) / 2048.0f;   // subtle texture, not pop
-            float alphaF = constrain(base + wobble, 0.10f, 1.0f); // lighter minimum rim, wider visible body
-            alphaF *= q.fade; // fade-in multiplier
+            // Soft Gaussian falloff
+            float base = expf(-d2 * 0.25f);
+
+            // Organic edges: two noise octaves, stronger further from center
+            uint8_t wn1 = inoise8((uint16_t)(x*37 + q.nseed), (uint16_t)(y*29 + q.nseed), (uint16_t)cloudG.tOffF);
+            uint8_t wn2 = inoise8((uint16_t)(x*73 + q.nseed*2), (uint16_t)(y*53 + q.nseed*2), (uint16_t)(cloudG.tOffF*1.5f));
+            float edgeDist = sqrtf(d2); // 0 at center, grows outward
+            float wobble = (((int)wn1 - 128) / 512.0f + ((int)wn2 - 128) / 1024.0f) * min(edgeDist, 1.5f);
+            float alphaF = constrain(base + wobble, 0.0f, 1.0f);
+
+            // Sub-pixel dithering for smoother horizontal movement
+            float fracCx = q.cx - floorf(q.cx);
+            float ditherMag = fracCx * (1.0f - fracCx) * 0.2f;
+            int ditherSign = (((x * 3 + y * 7) ^ (int)(cloudG.tOffF * 0.5f)) & 1) ? 1 : -1;
+            alphaF = constrain(alphaF + ditherMag * ditherSign, 0.0f, 1.0f);
+            alphaF *= q.fade;
             uint8_t alpha = (uint8_t)(alphaF * 255.0f);
 
+            // Lighter center: brighter and less saturated near core
+            float centerBlend = expf(-d2 * 1.5f);
             uint8_t v = (q.layer==FORE) ? 195 : (q.layer==MID ? 182 : 168);
-            CRGB c = CloudColor(q.hueJ, v);
+            uint8_t hue = 162 + (q.hueJ % 8);
+            uint8_t sat = 110 + (q.hueJ % 20);
+            sat = (uint8_t)max(0, (int)sat - (int)(centerBlend * 70));  // whiter center
+            v   = (uint8_t)min(255, (int)v + (int)(centerBlend * 55)); // brighter center
+            CRGB c = CHSV(hue, sat, v);
             nblend(cloudP(x,y), c, alpha);
           }
         }
@@ -685,17 +706,15 @@ void CloudParallax_Pattern(bool reset){
   // Medium separable blur: horizontal radius 2 then vertical radius 1
   static CRGB scratch[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];
 
-  // Horizontal blur (wrap in X), radius 2, weights [1,2,4,2,1]/10
+  // Horizontal blur (wrap in X), radius 3, weights [1,2,3,4,3,2,1]/16
   for (int y = 0; y < LEDS_PER_VIRTUAL_STRIP; ++y) {
     for (int x = 0; x < NUM_VIRTUAL_STRIPS; ++x) {
-      CRGB a = *virtualLeds[(x+NUM_VIRTUAL_STRIPS-2)%NUM_VIRTUAL_STRIPS][y];
-      CRGB b = *virtualLeds[(x+NUM_VIRTUAL_STRIPS-1)%NUM_VIRTUAL_STRIPS][y];
-      CRGB c = *virtualLeds[x][y];
-      CRGB d = *virtualLeds[(x+1)%NUM_VIRTUAL_STRIPS][y];
-      CRGB e = *virtualLeds[(x+2)%NUM_VIRTUAL_STRIPS][y];
-      scratch[x][y].r = (uint8_t)((a.r + 2*b.r + 4*c.r + 2*d.r + e.r) / 10);
-      scratch[x][y].g = (uint8_t)((a.g + 2*b.g + 4*c.g + 2*d.g + e.g) / 10);
-      scratch[x][y].b = (uint8_t)((a.b + 2*b.b + 4*c.b + 2*d.b + e.b) / 10);
+      CRGB p[7];
+      for (int k = -3; k <= 3; ++k)
+        p[k+3] = *virtualLeds[(x + k + NUM_VIRTUAL_STRIPS) % NUM_VIRTUAL_STRIPS][y];
+      scratch[x][y].r = (uint8_t)((p[0].r + 2*p[1].r + 3*p[2].r + 4*p[3].r + 3*p[4].r + 2*p[5].r + p[6].r) / 16);
+      scratch[x][y].g = (uint8_t)((p[0].g + 2*p[1].g + 3*p[2].g + 4*p[3].g + 3*p[4].g + 2*p[5].g + p[6].g) / 16);
+      scratch[x][y].b = (uint8_t)((p[0].b + 2*p[1].b + 3*p[2].b + 4*p[3].b + 3*p[4].b + 2*p[5].b + p[6].b) / 16);
     }
   }
 

@@ -42,6 +42,11 @@
 #define MAX_BANDS 12                         // Maximum FFT frequency bands
 #define BANDS_12 12                          // 12 bands for M patterns 0-5
 
+// Max pattern index per mode (used for wrapping)
+#define MAX_S_PATTERN 11                     // S mode: 12 colors (0-11)
+#define MAX_M_PATTERN 12                     // M mode: 13 visualizations (0-12)
+#define MAX_P_PATTERN 6                      // P mode: 7 patterns (0-6)
+
 // ============================================================================
 // Pin Configuration
 // ============================================================================

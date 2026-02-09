@@ -630,23 +630,31 @@ static void renderEQPeakDots() {
 }
 
 static void renderEQPulseColumns() {
-    int bands = currentBandCount;
-    if (bands < 1) bands = 1;
-    if (bands > MAX_BANDS) bands = MAX_BANDS;
+    // Single horizontal VU bar that grows left->right across the 12 strips.
+    // Uses globalVis (0..1). Keeps zig-zag layout via virtualLeds[][].
+    // Apply a curve to boost across the range and a slight gain on the top.
+    float level = constrain(globalVis, 0.0f, 1.0f);
+    level = powf(level + 0.02f, 0.60f);                   // lift lows/mids
+    level = min(1.0f, level * 1.25f);                     // extra headroom push
+    float litF = level * NUM_VIRTUAL_STRIPS;              // fractional lit columns
+    int   fullCols = (int)litF;                           // fully lit columns
+    float edgeFrac = litF - fullCols;                     // partial column brightness
 
-    int stripStart = 0;
-    int stripLimit = NUM_VIRTUAL_STRIPS;
-
-    for (int band = 0; band < bands; band++) {
-        int strip = stripStart + band;
-        if (strip >= stripLimit) continue;
-
-        uint8_t hue = (uint8_t)(band * (255 / max(bands, 1)));
-        uint8_t val = (uint8_t)(bandVis[band] * 255.0f);
+    // Hue sweep across width for visual interest
+    for (int x = 0; x < NUM_VIRTUAL_STRIPS; x++) {
+        uint8_t hue = (uint8_t)(x * (255 / max(1, NUM_VIRTUAL_STRIPS - 1)));
+        uint8_t val = 0;
+        if (x < fullCols) {
+            val = 255;
+        } else if (x == fullCols && edgeFrac > 0.001f) {
+            val = (uint8_t)(edgeFrac * 255.0f);
+        } else {
+            val = 0;
+        }
 
         for (int y = 0; y < matrix_height; y++) {
             int idx = FLIP_BARS_VERT ? (matrix_height - 1) - y : y;
-            *virtualLeds[strip][idx] = CHSV(hue, 255, val);
+            *virtualLeds[x][idx] = CHSV(hue, 255, val);
         }
     }
 
@@ -921,59 +929,6 @@ static void renderFire2012() {
     FastLED.show();
 }
 
-// ----------------------------------------------------------------------------
-// 2D Firenoise - Perlin noise across full 12x144 matrix with per-band audio
-// Adapted from WLED (Andrew Tuline).
-// fireSparking → Y scale (flame detail), fireCooling → X scale, fireAudioBoost → audio brightness
-// ----------------------------------------------------------------------------
-static void renderFirenoise2D() {
-    static const CRGBPalette16 firenoisePal(
-        CRGB::Black,       CRGB::Black,       CRGB::Black,       CRGB::Black,
-        CRGB::Red,         CRGB::Red,         CRGB::Red,         CRGB::DarkOrange,
-        CRGB::DarkOrange,  CRGB::DarkOrange,  CRGB::Orange,      CRGB::Orange,
-        CRGB::Yellow,      CRGB::Orange,      CRGB::Yellow,      CRGB::Yellow);
-
-    const bool auxFresh = (lastAuxPacketMs != 0 && (millis() - lastAuxPacketMs) < 200);
-    const int cols = NUM_VIRTUAL_STRIPS;    // 12
-    const int rows = LEDS_PER_VIRTUAL_STRIP; // 144
-    const uint32_t now = millis();
-
-    // fireSparking → Y scale, fireCooling → X scale (WLED: intensity*4, speed*8)
-    unsigned xscale = ((unsigned)fireSparking) * 4;
-    unsigned yscale = ((unsigned)(255 - fireCooling)) * 8;
-
-    for (int x = 0; x < cols; x++) {
-        // Per-band brightness modifier
-        float bandLevel = 0.0f;
-        float delta = 0.0f;
-        if (auxFresh && x < MAX_BANDS) {
-            bandLevel = bandVis8[x] / 255.0f;
-            delta = bandDelta8[x] / 255.0f;
-        } else if (x < MAX_BANDS) {
-            bandLevel = bandVis[x];
-        }
-        float colMod = 0.3f + (bandLevel + delta * 0.5f) * 0.7f * fireAudioBoost;
-        if (colMod > 1.5f) colMod = 1.5f;
-
-        for (int y = 0; y < rows; y++) {
-            // Reverse row index: y=0 (bottom) → ri=143 (hot), y=143 (top) → ri=0 (dark)
-            int ri = rows - 1 - y;
-
-            uint16_t nx = (uint16_t)(x * yscale * rows / 255);
-            uint16_t ny = (uint16_t)(ri * xscale + now / 4);
-            unsigned indexx = inoise8(nx, ny);
-
-            uint8_t palIdx = (uint8_t)min((unsigned)(ri * indexx / 11), 225U);
-            unsigned brtCalc = (unsigned)((float)(ri * 255 / rows) * colMod);
-            if (brtCalc > 255) brtCalc = 255;
-
-            *virtualLeds[x][y] = ColorFromPalette(firenoisePal, palIdx, (uint8_t)brtCalc, LINEARBLEND);
-        }
-    }
-
-    FastLED.show();
-}
-
 // Simple sparkle overlay driven by vocal energy and note
 static void overlayVocalSparkles() {
     // Onset: vocal syllable or strong delta in vocal bands
@@ -1047,7 +1002,7 @@ static void overlayClusterSparklesM7() {
     // bandDelta8 range: 0-255, need a real jump (>30) for a burst
     bool onset = false;
     uint8_t strength = 0;
-    if (maxDelta > 30) {
+    if (maxDelta > 22) {
         onset = true;
         strength = maxDelta;
     } else if (vocalSyllable && vocalEnv > 60) {
@@ -1080,9 +1035,9 @@ static void overlayClusterSparklesM7() {
 
     // --- Emit sparks: count and radius scale with peak strength ---
     // strength 30-255 maps to 10-45 sparks per frame
-    uint8_t emitCount = 10 + ((uint16_t)burstStrength * 35) / 255 + random8(6);
-    // Tight cluster radius: 5-12 pixels (dense, not spread)
-    float baseR = 5.0f + (burstStrength / 255.0f) * 7.0f;
+    uint8_t emitCount = 14 + ((uint16_t)burstStrength * 40) / 255 + random8(6);
+    // Tight cluster radius: 3-8 pixels (denser clustering)
+    float baseR = 3.0f + (burstStrength / 255.0f) * 5.0f;
 
     for (int e = 0; e < emitCount; e++) {
         int slot = -1;
@@ -1122,7 +1077,8 @@ static void renderMusicVisualization() {
             renderEQPeakDots();
             break;
         case 4:
-            renderEQPulseColumns();
+            // Was a flat white left→right bar; remap to colored EQ bars to avoid the all-white look.
+            renderEQBarsRainbow();
             break;
         case 5:
             renderEQBarsMono();
@@ -1137,37 +1093,28 @@ static void renderMusicVisualization() {
             overlayClusterSparklesM7();
             FastLED.show();
             break;
+        case 8:
+            // WLED Noisefire: Perlin noise fire, per-band volume brightness
+            renderNoiseFire();
+            break;
         case 9:
             // Aurora (note sparks) original behavior
             AuroraNoteSparks_Run(reset);
             break;
         case 10:
-            // Meteorite Rain (sound-reactive peak echoes)
-            meteoriteRain(false);
-            break;
-        case 11:
             // Red Comet with Audio (music visualization)
             RedCometWithAudio1();
             break;
-        case 8:
-            // WLED Noisefire: Perlin noise fire, per-band volume brightness
-            renderNoiseFire();
+        case 11:
+            // Cloud + Aurora + vocal sparkles
+            CloudParallax_Pattern(reset);
+            AuroraOnCloud_Run(reset);
+            overlayVocalSparkles();
+            FastLED.show();
             break;
         case 12:
-            // New hybrid: Cloud background (Pattern 8) + AuroraOrganic foreground
-            CloudParallax_Pattern(reset);   // draw ambient clouds (animated every frame)
-            AuroraOnCloud_Run(reset);       // music-reactive blobs/sparks, no background overwrite
-            // Vocal-color sparkles overlay
-            overlayVocalSparkles();
-            FastLED.show();                 // show once
-            break;
-        case 13:
             // WLED Fire 2012: Classic heat sim with audio-reactive sparking
             renderFire2012();
-            break;
-        case 14:
-            // WLED 2D Firenoise: Perlin noise across 12x144 matrix
-            renderFirenoise2D();
             break;
         default:
             renderEQBarsBasic();

@@ -159,17 +159,23 @@ void handleIRCommand(uint32_t command) {
       
     case APPLE_RIGHT:
     case APPLE_REPEAT:
-      // Increment color (0-12, wraps around)
-      colorIndex++;
-      if (colorIndex > 12) colorIndex = 0;
-      sendCommand(mode, colorIndex, brightness, param3);
+      {
+        // Increment pattern/color, wrap per mode
+        uint8_t maxIdx = (mode == 'M') ? 12 : (mode == 'P') ? 6 : 11;
+        colorIndex++;
+        if (colorIndex > maxIdx) colorIndex = 0;
+        sendCommand(mode, colorIndex, brightness, param3);
+      }
       break;
-      
+
     case APPLE_LEFT:
-      // Decrement color (0-12, wraps around)
-      if (colorIndex == 0) colorIndex = 12;
-      else colorIndex--;
-      sendCommand(mode, colorIndex, brightness, param3);
+      {
+        // Decrement pattern/color, wrap per mode
+        uint8_t maxIdx = (mode == 'M') ? 12 : (mode == 'P') ? 6 : 11;
+        if (colorIndex == 0) colorIndex = maxIdx;
+        else colorIndex--;
+        sendCommand(mode, colorIndex, brightness, param3);
+      }
       break;
       
     case APPLE_UP:

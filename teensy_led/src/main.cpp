@@ -50,7 +50,7 @@ struct ModeSettings {
 };
 ModeSettings savedMusic = {0, 10};    // Music mode: visualization 0, brightness 10
 ModeSettings savedSolid = {0, 10};    // Solid mode: color 0, brightness 10
-ModeSettings savedPattern = {2, 10};  // Pattern mode: pattern 2 (rainbow), brightness 10
+ModeSettings savedPattern = {0, 10};  // Pattern mode: pattern 0 (rainbow), brightness 10
 
 bool firstRun = false;
 bool message = true;
