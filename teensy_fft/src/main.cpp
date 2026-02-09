@@ -454,19 +454,6 @@ void calculatePitch() {
     }
     recalcKeyIfDue(now);
 
-    if (Serial) {
-        Serial.print("[NOTE] ");
-        if (dominantPitch < 12) {
-            Serial.print(pitchNames[dominantPitch]);
-            Serial.print(dominantPitchHz);
-            Serial.print("Hz ");
-            Serial.print(dominantPitchStrength);
-        } else {
-            Serial.print("--");
-        }
-        Serial.println();
-    }
-
     // Accumulate HPS energy per pitch class (for LED payload)
     for (int i = 0; i < NUM_PITCH_CLASSES; i++) hpsPitchClass[i] = 0.0f;
     for (int bin = HPS_BIN_START; bin <= HPS_BIN_END; bin++) {

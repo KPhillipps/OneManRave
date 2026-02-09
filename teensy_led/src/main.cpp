@@ -187,54 +187,6 @@ static void applyCommandPayload(const uint8_t* payload) {
     switchToMode(newMode, newPattern, newBrightness);
     printControlStatus("[RX CMD]", state.mode, state.pattern, state.brightness);
     Serial.printf("[CMD] mode=%c pattern=%d brightness=%d\n", state.mode, state.pattern, state.brightness);
-
-#if DEBUG_STATUS
-    // Print CPU stats on command reception only
-    unsigned long now = millis();
-#if DEBUG_STATUS
-    if (cpuWindowStartMs == 0) {
-        cpuWindowStartMs = now;
-    }
-#endif
-    if (cpuWindowStartMs == 0) {
-        cpuWindowStartMs = now;
-    }
-    unsigned long windowMs = now - cpuWindowStartMs;
-    STAT_PRINT("CMD CPU: ");
-    if (windowMs > 0) {
-        float avgCpu = (frameWorkAccumUs / (windowMs * 1000.0f)) * 100.0f;
-        float peakCpu = (frameWorkMaxUs / (FRAME_PERIOD_MS * 1000.0f)) * 100.0f;
-        STAT_PRINT(avgCpu, 1);
-        STAT_PRINT("% avg / ");
-        STAT_PRINT(peakCpu, 1);
-    } else {
-        STAT_PRINT("0.0% avg / 0.0");
-    }
-    STAT_PRINT("% peak");
-    STAT_PRINT(" | Mode: ");
-    STAT_PRINT(state.mode);
-    STAT_PRINT(" | ");
-    STAT_PRINT(patternLabelForMode(state.mode));
-    STAT_PRINT(": ");
-    STAT_PRINT(state.pattern);
-    STAT_PRINT(" | Brightness: ");
-    STAT_PRINT(FastLED.getBrightness());
-    STAT_PRINT(" | VocalEnv: ");
-    STAT_PRINT(vocalEnv);
-    STAT_PRINT(" | VocalSyl: ");
-    STAT_PRINT(vocalSyllable);
-    STAT_PRINT(" | VocalNote: ");
-    STAT_PRINT(vocalNote);
-    STAT_PRINT(" | VocalStr: ");
-    STAT_PRINT(vocalNoteStrength);
-    STAT_PRINT(" | VocalSus: ");
-    STAT_PRINT(vocalSustain);
-    STAT_PRINTLN();
-
-    frameWorkAccumUs = 0;
-    frameWorkMaxUs = 0;
-    cpuWindowStartMs = now;
-#endif
 }
 
 // Parse and apply USB CSV line: "M,pattern,brightness"

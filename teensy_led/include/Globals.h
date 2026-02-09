@@ -10,7 +10,7 @@
 #define DEBUG_SERIAL 0
 #endif
 #ifndef DEBUG_STATUS
-#define DEBUG_STATUS 1
+#define DEBUG_STATUS 0
 #endif
 
 #if DEBUG_SERIAL
