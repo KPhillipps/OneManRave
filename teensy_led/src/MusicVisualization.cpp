@@ -462,18 +462,6 @@ void computeVisualBands() {
     beatFlash = 0.0f;
 }
 
-static void dumpVizTable() {
-    static unsigned long lastDump = 0;
-    if (millis() - lastDump < 500) return;
-    lastDump = millis();
-
-    DBG_SERIAL_PRINT("[VIZ] ");
-    for (int i = 0; i < currentBandCount; i++) {
-        DBG_SERIAL_PRINTF("%.2f>%.2f ", bandAmplitude[i], bandVis[i]);
-    }
-    DBG_SERIAL_PRINTLN();
-}
-
 // ============================================================================
 // Music Visualization Renderers (uses computed bandVis[])
 // ============================================================================
@@ -1128,6 +1116,5 @@ static void renderMusicVisualization() {
 void mapAmplitudesToLEDs() {
     currentBandCount = getBandCountForPattern(state.pattern);
     computeVisualBands();
-    dumpVizTable();
     renderMusicVisualization();
 }

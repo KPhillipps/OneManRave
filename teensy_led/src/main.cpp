@@ -134,19 +134,6 @@ unsigned long lastPacketTime = 0;
 // ============================================================================
 // Serial1 Receiver - Binary FFT
 // ============================================================================
-static const char* patternLabelForMode(char mode) {
-    switch (mode) {
-        case 'S': return "Color";
-        case 'M': return "Viz";
-        case 'P': return "Pattern";
-        default:  return "Pattern";
-    }
-}
-
-static void printControlStatus(const char* tag, char mode, int pattern, int brightness) {
-    DBG_SERIAL_PRINTF("%s Mode:%c %s:%d Brt:%d\n", tag, mode, patternLabelForMode(mode), pattern, brightness);
-}
-
 // Forward declaration (used by applyCommandPayload)
 static void switchToMode(char newMode, int pattern, int brightness);
 
@@ -185,7 +172,6 @@ static void applyCommandPayload(const uint8_t* payload) {
     int newBrightness = payload[3];
 
     switchToMode(newMode, newPattern, newBrightness);
-    printControlStatus("[RX CMD]", state.mode, state.pattern, state.brightness);
     Serial.printf("[CMD] mode=%c pattern=%d brightness=%d\n", state.mode, state.pattern, state.brightness);
 }
 
@@ -289,10 +275,6 @@ static void switchToMode(char newMode, int pattern, int brightness) {
 // Binary: [SOF=0xAA][type][seq][len][payload][crc16][EOF=0xBB]
 // ============================================================================
 void processSerialData() {
-    static unsigned long lastDebugTime = 0;
-    static int packetsReceived = 0;
-    static int commandsReceived = 0;
-    static int crcErrors = 0;
     static unsigned long lastByteMs = 0;
 
     auto resyncFromBuffer = [&]() {
@@ -372,7 +354,6 @@ void processSerialData() {
                     uint16_t calcCrc = Proto::crc16_ccitt(&rxBuffer[1], 3 + payloadLen);
 
                     if (rxCrc != calcCrc) {
-                        crcErrors++;
                         DBG_SERIAL_PRINTF("[RX DROP] len=%u crc=fail (rx=0x%04X calc=0x%04X)\n", payloadLen, rxCrc, calcCrc);
                         resyncFromBuffer();
                         continue;
@@ -403,16 +384,8 @@ void processSerialData() {
                         vocalSustain = payload[67];
 
                         lastPacketTime = millis();
-                        packetsReceived++;
-
-                        // Debug: Print received values more frequently
-                        static unsigned long lastRxDebug = 0;
-                        if (millis() - lastRxDebug > 500) {
-                            lastRxDebug = millis();
-                        }
                     } else if (frameType == Proto::TYPE_CMD && payloadLen == Proto::FIXED_PAYLOAD_LEN) {
                         applyCommandPayload(payload);
-                        commandsReceived++;
                     } else if (frameType == Proto::TYPE_AUX && payloadLen == Proto::AUX_PAYLOAD_LEN) {
                         // AUX payload layout (36 bytes):
                         // 0-11:  bandVis[12] (0-255)
@@ -447,23 +420,6 @@ void processSerialData() {
         }
     }
 
-    // Debug output every second
-    if (millis() - lastDebugTime > 3000) {
-        if (packetsReceived > 0 || commandsReceived > 0 || crcErrors > 0) {
-            DBG_SERIAL_PRINTF("RLED Serial1: %d FFT, %d CMD, %d CRC errors\n", packetsReceived, commandsReceived, crcErrors);
-        }
-        packetsReceived = 0;
-        commandsReceived = 0;
-        crcErrors = 0;
-        lastDebugTime = millis();
-    }
-
-    // Warn if no FFT packets
-    static unsigned long lastNoPacketWarning = 0;
-    if (millis() - lastPacketTime > 2000 && millis() - lastNoPacketWarning > 5000) {
-        DBG_SERIAL_PRINTLN("WARNING: No FFT packets from FFT Teensy");
-        lastNoPacketWarning = millis();
-    }
 }
 
 // ============================================================================
