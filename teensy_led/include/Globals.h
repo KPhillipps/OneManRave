@@ -43,6 +43,20 @@
 #define LEDS_PER_PHYSICAL_STRIP 288          // LEDs per physical strip
 #define NUM_PHYSICAL_STRIPS 6                // Total physical strips
 #define NUM_VIRTUAL_STRIPS 12                // Virtual strips (each physical → 2 virtual)
+
+// LED CRGB buffer size.
+//   - WS2812B path uses FastLED's OCTOWS2811 controller, which has 8 fixed
+//     channels (pins 2,14,7,8,6,20,21,5). All 8 channels must be present in
+//     the leds[] buffer even if only 6 are wired (ch5=pin20 and ch7=pin5 are
+//     unused on the left-side board). Buffer = 8 * 288 = 2304.
+//   - APA102 path uses 6 strips wired sequentially in addLeds order,
+//     buffer = 6 * 288 = 1728.
+#ifdef USE_WS2812B
+#define NUM_OCTO_CHANNELS 8
+#define LED_BUFFER_SIZE (NUM_OCTO_CHANNELS * LEDS_PER_PHYSICAL_STRIP)
+#else
+#define LED_BUFFER_SIZE (NUM_STRIPS * LEDS_PER_PHYSICAL_STRIP)
+#endif
 #define MAX_BANDS 12                         // Maximum FFT frequency bands
 #define BANDS_12 12                          // 12 bands for M patterns 0-5
 

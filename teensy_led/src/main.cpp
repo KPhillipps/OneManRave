@@ -5,6 +5,12 @@ extern "C" char usb_string_serial_number[];
 // Uncomment to run LED strip tests on startup
 // #define DEBUG_LED_TEST
 
+#ifdef USE_WS2812B
+// FastLED's OCTOWS2811 controller wraps OctoWS2811 for DMA-driven parallel
+// output. USE_OCTOWS2811 must be defined (build flag) and OctoWS2811.h must
+// be included BEFORE FastLED.h.
+#include <OctoWS2811.h>
+#endif
 #include <FastLED.h>
 #include "ColorDefinitions.h"
 #include "Patterns.h"
@@ -33,8 +39,10 @@ extern "C" char usb_string_serial_number[];
 //   'A' = Art/bitmap display
 // ============================================================================
 
-// Global LED Arrays
-CRGB leds[1728];    // Physical array: 6 strips × 288 LEDs
+// Global LED Arrays.
+//   - WS2812B path: 8 OctoWS2811 channels × 288 = 2304 (ch5/ch7 unused but required)
+//   - APA102 path:  6 strips × 288 = 1728
+CRGB leds[LED_BUFFER_SIZE];
 CRGB* virtualLeds[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];  // 12 virtual strips, each LED mapped individually
 constexpr int LEDL = NUM_STRIPS * LEDS_PER_PHYSICAL_STRIP;
 #ifdef USE_WS2812B
@@ -565,30 +573,37 @@ void initializeVirtualStripsAPA102Right() {
 }
 
 void initializeVirtualStripsWS2812BLeft() {
-    // Verified physical L->R layout for the WS2812B (left) installation.
-    // chainIndex follows the FastLED.addLeds order in the WS2812B branch:
-    //   chain 0 = pin 6, chain 1 = pin 7, chain 2 = pin 2,
-    //   chain 3 = pin 21, chain 4 = pin 14, chain 5 = pin 8
-    // Pairs:
+    // Verified physical L->R layout for the WS2812B (left) installation,
+    // driven via FastLED's OCTOWS2811 controller. OctoWS2811 has a FIXED
+    // channel->pin mapping on Teensy 4:
+    //   chain 0 = ch0 = pin 2
+    //   chain 1 = ch1 = pin 14
+    //   chain 2 = ch2 = pin 7
+    //   chain 3 = ch3 = pin 8
+    //   chain 4 = ch4 = pin 6
+    //   chain 5 = ch5 = pin 20  (NOT WIRED on this board)
+    //   chain 6 = ch6 = pin 21
+    //   chain 7 = ch7 = pin 5   (NOT WIRED on this board)
+    // Pairs (verified 2026-04-07 by strip_id_test):
     //   v 0: pin7  up    v 1: pin7  down
     //   v 2: pin6  down  v 3: pin6  up
     //   v 4: pin21 down  v 5: pin21 up
     //   v 6: pin2  up    v 7: pin2  down
     //   v 8: pin8  up    v 9: pin8  down
     //   v10: pin14 down  v11: pin14 up
-    mapVirtualStrip( 0, /*pin7  chain*/ 1, true  );
-    mapVirtualStrip( 1, /*pin7  chain*/ 1, false );
-    mapVirtualStrip( 2, /*pin6  chain*/ 0, false );
-    mapVirtualStrip( 3, /*pin6  chain*/ 0, true  );
-    mapVirtualStrip( 4, /*pin21 chain*/ 3, false );
-    mapVirtualStrip( 5, /*pin21 chain*/ 3, true  );
-    mapVirtualStrip( 6, /*pin2  chain*/ 2, true  );
-    mapVirtualStrip( 7, /*pin2  chain*/ 2, false );
-    mapVirtualStrip( 8, /*pin8  chain*/ 5, true  );
-    mapVirtualStrip( 9, /*pin8  chain*/ 5, false );
-    mapVirtualStrip(10, /*pin14 chain*/ 4, false );
-    mapVirtualStrip(11, /*pin14 chain*/ 4, true  );
-    DBG_SERIAL_PRINTLN("Virtual strips initialized: WS2812B left (12 strips L->R).");
+    mapVirtualStrip( 0, /*pin7  ch2*/ 2, true  );
+    mapVirtualStrip( 1, /*pin7  ch2*/ 2, false );
+    mapVirtualStrip( 2, /*pin6  ch4*/ 4, false );
+    mapVirtualStrip( 3, /*pin6  ch4*/ 4, true  );
+    mapVirtualStrip( 4, /*pin21 ch6*/ 6, false );
+    mapVirtualStrip( 5, /*pin21 ch6*/ 6, true  );
+    mapVirtualStrip( 6, /*pin2  ch0*/ 0, true  );
+    mapVirtualStrip( 7, /*pin2  ch0*/ 0, false );
+    mapVirtualStrip( 8, /*pin8  ch3*/ 3, true  );
+    mapVirtualStrip( 9, /*pin8  ch3*/ 3, false );
+    mapVirtualStrip(10, /*pin14 ch1*/ 1, false );
+    mapVirtualStrip(11, /*pin14 ch1*/ 1, true  );
+    DBG_SERIAL_PRINTLN("Virtual strips initialized: WS2812B left via OctoWS2811 (12 strips L->R).");
 }
 
 // Legacy entry point - defaults to the APA102 right layout, since that's the
@@ -774,15 +789,14 @@ void setup() {
 
     // Initialize LED strips - branch on detected board.
     if (isLeftWS2812B) {
-        // Left side: WS2812B (single data wire, GRB order). Pin 5 is NOT
-        // wired on this board; pin 14 is the 6th data line (no clock needed).
-        // Chain order: 0=pin6, 1=pin7, 2=pin2, 3=pin21, 4=pin14, 5=pin8.
-        FastLED.addLeds<WS2812B, 6,  GRB>(leds,        288);
-        FastLED.addLeds<WS2812B, 7,  GRB>(leds + 288,  288);
-        FastLED.addLeds<WS2812B, 2,  GRB>(leds + 576,  288);
-        FastLED.addLeds<WS2812B, 21, GRB>(leds + 864,  288);
-        FastLED.addLeds<WS2812B, 14, GRB>(leds + 1152, 288);
-        FastLED.addLeds<WS2812B, 8,  GRB>(leds + 1440, 288);
+        // Left side: WS2812B driven via FastLED's OCTOWS2811 controller.
+        // OctoWS2811 uses DMA + hardware timers for parallel output across
+        // 8 fixed channels (pins 2,14,7,8,6,20,21,5). This is immune to the
+        // Serial1 RX ISR jitter that breaks FastLED's bit-banged WS2812B
+        // driver at 460800 baud. The leds[] buffer must hold all 8 channels
+        // (LED_BUFFER_SIZE = 2304); ch5 (pin 20) and ch7 (pin 5) are not
+        // wired on this board but their buffer slots still need to exist.
+        FastLED.addLeds<OCTOWS2811>(leds, LEDS_PER_PHYSICAL_STRIP);
     } else {
         // Right side: APA102 (SPI with shared clock, BGR order). Default
         // for unknown boards too — APA102 is the original wiring.
