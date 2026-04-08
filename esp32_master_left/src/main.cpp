@@ -82,13 +82,52 @@ uint8_t param3 = 0;
 unsigned long lastCommandTime = 0;
 const unsigned long REPEAT_DELAY = 150; // ms between repeat commands
 
+const uint8_t BRIGHTNESS_MAX = 27;
+
+uint8_t getColorIndexMaxForMode(char currentMode) {
+  if (currentMode == 'M') return 12;
+  if (currentMode == 'P') return 6;
+  return 11;
+}
+
+void clampState() {
+  uint8_t maxColorIndex = getColorIndexMaxForMode(mode);
+
+  if (colorIndex > maxColorIndex) {
+    Serial.print("Color index out of range (");
+    Serial.print(colorIndex);
+    Serial.print("), clamping to ");
+    Serial.println(maxColorIndex);
+    colorIndex = maxColorIndex;
+  }
+
+  if (brightness > BRIGHTNESS_MAX) {
+    Serial.print("Brightness out of range (");
+    Serial.print(brightness);
+    Serial.println("), clamping to 27");
+    brightness = BRIGHTNESS_MAX;
+  }
+}
+
 void sendCommand(char cmd, uint8_t val1, uint8_t val2, uint8_t val3) {
+  uint8_t maxColorIndex = getColorIndexMaxForMode(cmd);
+  uint8_t safeColorIndex = val1;
+  uint8_t safeBrightness = val2;
+
+  if (safeColorIndex > maxColorIndex) {
+    safeColorIndex = maxColorIndex;
+  }
+
+  if (safeBrightness > BRIGHTNESS_MAX) {
+    safeBrightness = BRIGHTNESS_MAX;
+  }
+
   // Send format: "mode,val1,val2,val3\n" for LED Teensy
   // This function sends to BOTH channels:
   //   1. LEFT channel via Serial (direct to Teensy FFT Left)
   //   2. RIGHT channel via ESP-NOW (to Slave ESP32, which forwards to Teensy FFT Right)
   char buffer[32];
-  int len = snprintf(buffer, sizeof(buffer), "%c,%u,%u,%u", cmd, val1, val2, val3);
+  int len = snprintf(buffer, sizeof(buffer), "%c,%u,%u,%u", cmd, safeColorIndex, safeBrightness, val3);
   if (len < 0 || len >= (int)sizeof(buffer)) {
     Serial.println("Command format error - skipped send");
     return;
@@ -115,8 +154,8 @@ void sendCommand(char cmd, uint8_t val1, uint8_t val2, uint8_t val3) {
   // Slave will receive this and forward to Teensy FFT Right
   // ---------------------------------------------------------------
   outgoingData.mode = cmd;
-  outgoingData.colorIndex = val1;
-  outgoingData.brightness = val2;
+  outgoingData.colorIndex = safeColorIndex;
+  outgoingData.brightness = safeBrightness;
   outgoingData.param3 = val3;
   
   esp_err_t result = esp_now_send(slaveMacAddress, (uint8_t *) &outgoingData, sizeof(outgoingData));
@@ -136,6 +175,7 @@ void handleIRCommand(uint32_t command) {
   }
   
   lastCommandTime = now;
+  clampState();
   
   switch (command) {
     case APPLE_PLAY:
@@ -159,19 +199,19 @@ void handleIRCommand(uint32_t command) {
       
     case APPLE_RIGHT:
     case APPLE_REPEAT:
+      // Increment pattern/color, wrap per mode
       {
-        // Increment pattern/color, wrap per mode
-        uint8_t maxIdx = (mode == 'M') ? 12 : (mode == 'P') ? 6 : 11;
+        uint8_t maxIdx = getColorIndexMaxForMode(mode);
         colorIndex++;
         if (colorIndex > maxIdx) colorIndex = 0;
         sendCommand(mode, colorIndex, brightness, param3);
       }
       break;
-
+      
     case APPLE_LEFT:
+      // Decrement pattern/color, wrap per mode
       {
-        // Decrement pattern/color, wrap per mode
-        uint8_t maxIdx = (mode == 'M') ? 12 : (mode == 'P') ? 6 : 11;
+        uint8_t maxIdx = getColorIndexMaxForMode(mode);
         if (colorIndex == 0) colorIndex = maxIdx;
         else colorIndex--;
         sendCommand(mode, colorIndex, brightness, param3);
@@ -180,7 +220,7 @@ void handleIRCommand(uint32_t command) {
       
     case APPLE_UP:
       // Increase brightness (0-27)
-      if (brightness < 27) brightness++;
+      if (brightness < BRIGHTNESS_MAX) brightness++;
       sendCommand(mode, colorIndex, brightness, param3);
       break;
       
@@ -267,6 +307,7 @@ void setup() {
   Serial.println("ESP Master ready");
   
   // Send initial state
+  clampState();
   sendCommand(mode, colorIndex, brightness, param3);
   Serial.println("Initial command sent to Teensy");
 }

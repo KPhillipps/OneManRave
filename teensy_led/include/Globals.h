@@ -34,7 +34,11 @@
 // ============================================================================
 // LED Configuration
 // ============================================================================
-#define NUM_APA102_STRIPS 6                  // 6 physical APA102 strips
+// Comment/uncomment to switch between left (WS2812B) and right (APA102) sides
+#define USE_WS2812B   // Left side: WS2812B strips
+// #define USE_APA102 // Right side: APA102 strips
+
+#define NUM_STRIPS 6                         // 6 physical strips
 #define LEDS_PER_VIRTUAL_STRIP 144           // LEDs per virtual strip
 #define LEDS_PER_PHYSICAL_STRIP 288          // LEDs per physical strip
 #define NUM_PHYSICAL_STRIPS 6                // Total physical strips
@@ -50,11 +54,9 @@
 // ============================================================================
 // Pin Configuration
 // ============================================================================
-const int CLOCK_PIN = 14;  // Shared SPI clock for all APA102 strips
-const int BUFFER_ENABLE = 3;  // 74HCT245 OE pin (active high)
-
 // Data pins for each strip (must match FastLED.addLeds order in main.cpp)
-constexpr int STRIP_PINS[6] = {6, 7, 8, 2, 21, 5};
+constexpr int STRIP_PINS[6] = {6, 7, 2, 21, 5, 8};
+constexpr int CLOCK_PIN = 14;  // Shared SPI clock for APA102 strips (right side)
 
 // ============================================================================
 // Global LED Arrays (extern - defined in main.cpp)

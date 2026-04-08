@@ -10,36 +10,35 @@
 
 ## LED Strips
 
-- **Type:** APA102 (4-wire SPI)
+- **Type:** WS2812B (single data wire), 144 LED/m, OZES brand
 - **Strips:** 6 physical strips
 - **LEDs per strip:** 288 (144 up + 144 down zigzag)
 - **Total LEDs:** 1728
-- **Clock pin:** 13 (shared)
-- **Data pins:** 2, 3, 4, 5, 16, 18
+- **Data pins:** 6, 7, 2, 21, 5, 8
 
 ## Pin Assignments
 
-### LED Teensy (teensy40_led)
+### LED Teensy (teensy_led)
 | Pin | Function |
 |-----|----------|
 | 0 | Serial1 RX (from FFT Teensy) |
-| 2 | LED Strip 0 Data |
-| 3 | LED Strip 1 Data |
-| 4 | LED Strip 2 Data |
-| 5 | LED Strip 3 Data |
-| 13 | APA102 Clock (all strips) |
-| 16 | LED Strip 4 Data |
-| 18 | LED Strip 5 Data |
+| 2 | LED Strip 2 Data |
+| 5 | LED Strip 4 Data |
+| 6 | LED Strip 0 Data |
+| 7 | LED Strip 1 Data |
+| 8 | LED Strip 5 Data |
+| 21 | LED Strip 3 Data |
 
-### FFT Teensy (teensy40_fft)
+### FFT Teensy (teensy_fft)
 | Pin | Function |
 |-----|----------|
-| 8 | Serial2 TX (to LED Teensy) |
+| 0 | Serial1 RX (from ESP32) |
+| 1 | Serial1 TX (to LED Teensy) |
 | SPDIF | Digital audio input |
 
 ## Serial Protocol
 
-- **Baud rate:** 460800
+- **Baud rate:** 460800 on Serial1
 - **Frame format:** `[0xAA][type][seq][len][payload][crc16][0xBB]`
 - **FFT payload:** 45 bytes (10 floats + beat float + SPDIF lock byte)
 - **CMD payload:** 5 bytes (mode, pattern, color, brightness, flags)
@@ -47,5 +46,5 @@
 ## Power
 
 - **Voltage:** 5V
-- **Max current:** 50A
-- **Power limit:** 250W (configured in FastLED)
+- **Power per strip:** 43W
+- **Power limit:** 258W (configured in FastLED)

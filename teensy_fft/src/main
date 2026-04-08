@@ -69,7 +69,7 @@ const int MAX_BANDS = 12;
 // Display settings
 const float smoothingFactor = 0.15;
 const float FFT_CAL_GAIN = 8000.0f;
-const bool PRINT_NOTES_ONLY = true;
+const bool PRINT_NOTES_ONLY = false;
 const float bandTilt12[BANDS_12] = {
     1.0f, 1.0f, 1.05f, 1.1f, 1.15f, 1.2f,
     1.3f, 1.4f, 1.5f, 1.7f, 1.85f, 2.0f};
@@ -114,7 +114,9 @@ static uint8_t peakDetected = 0;
 static float globalVisAvg = 0.0f;
 
 // Channel selection by USB serial number (moved up for chord detection)
+// Current FFT RIGHT Teensy connected in this project: 16102920
 static const char* SERIAL_RIGHT = "16102920";
+// Left board not added yet; keep prior known value as placeholder.
 static const char* SERIAL_LEFT = "19236400";
 static AudioAnalyzeFFT1024* activeFft = &fftLeft;
 static const char* activeChannelLabel = "LEFT (ch0)";
@@ -282,9 +284,6 @@ static void recalcKeyIfDue(uint32_t now) {
     if (keyHistTotal == 0) {
         currentKey = 255;
         currentMode = 0;
-        if (Serial && !PRINT_NOTES_ONLY) {
-            Serial.println("[KEY] --");
-        }
         return;
     }
 
@@ -322,15 +321,6 @@ static void recalcKeyIfDue(uint32_t now) {
 
     currentKey = static_cast<uint8_t>(bestKey);
     currentMode = static_cast<uint8_t>(bestMode);
-
-    if (Serial && !PRINT_NOTES_ONLY) {
-        Serial.print("[KEY] ");
-        Serial.print(pitchNames[currentKey]);
-        Serial.print(currentMode == 0 ? "maj" : "min");
-        Serial.print(" total=");
-        Serial.print(keyHistTotal);
-        Serial.println();
-    }
 }
 
 // Harmonic Product Spectrum: geometric mean of fundamental × harmonics
@@ -378,33 +368,6 @@ void calculatePitch() {
 
     float avgHps = totalHps / binCount;
     float peakRatio = (avgHps > 1e-7f) ? (peakVal / avgHps) : 0.0f;
-
-    // Debug every frame — scan full FFT for peak magnitude
-    if (Serial && !PRINT_NOTES_ONLY) {
-        float fftPeakMag = 0.0f;
-        int fftPeakBin = 0;
-        for (int b = 1; b <= 511; b++) {
-            float m = activeFft->read(b);
-            if (m > fftPeakMag) { fftPeakMag = m; fftPeakBin = b; }
-        }
-        Serial.print("[HPS] fftPk=");
-        Serial.print(fftPeakMag, 4);
-        Serial.print("@");
-        Serial.print(fftPeakBin);
-        Serial.print("(");
-        Serial.print((int)(fftPeakBin * binFreqHz));
-        Serial.print("Hz) hpsPk=");
-        Serial.print(peakVal, 5);
-        Serial.print(" avg=");
-        Serial.print(avgHps, 5);
-        Serial.print(" ratio=");
-        Serial.print(peakRatio, 1);
-        Serial.print(" hpsBin=");
-        Serial.print(peakBin);
-        Serial.print(" env=");
-        Serial.print(vocalEnvSmoothed, 2);
-        Serial.println();
-    }
 
     // Gate: only report confidence when vocal envelope is active and peak stands out
     bool pitchValid = (peakVal > 1e-5f && peakRatio > HPS_PEAK_RATIO_THRESH &&
@@ -703,18 +666,11 @@ const unsigned long FRAME_PERIOD_MS = 17;  // ~60 FPS
 
 // Status timing
 unsigned long lastStatusTime = 0;
-const unsigned long STATUS_INTERVAL_MS = 5000;
+const unsigned long STATUS_INTERVAL_MS = 10000;
 
 unsigned long fftFrameCountWindow = 0;
 unsigned long lastFftFrameReport = 0;
 const unsigned long FFT_REPORT_INTERVAL_MS = 2000;
-static bool fftFrameSeenSinceStatus = false;
-
-// CPU usage tracking
-static uint32_t cpuIntervalStartMicros = 0;
-static uint64_t cpuBusySumMicros = 0;
-static uint32_t cpuLoopMaxMicros = 0;
-static uint32_t cpuLoopCount = 0;
 
 // Beat detection removed
 
@@ -724,7 +680,6 @@ static uint32_t cpuLoopCount = 0;
 void calculateBandAmplitudes() {
     if (activeFft->available()) {
         fftFrameCountWindow++;
-        fftFrameSeenSinceStatus = true;
 
         // Calculate band amplitudes
         for (int band = 0; band < BANDS_12; band++) {
@@ -937,7 +892,12 @@ void forwardESP32Commands() {
     uint8_t frame[1 + 1 + 1 + 1 + Proto::CMD_PAYLOAD_LEN + 2 + 1];
     size_t frameLen = 0;
     if (Proto::encodeFrame(Proto::TYPE_CMD, cmdSeq++, payload, Proto::CMD_PAYLOAD_LEN, frame, sizeof(frame), frameLen)) {
-        Serial2.write(frame, frameLen);
+        size_t written = Serial2.write(frame, frameLen);
+        if (Serial && !PRINT_NOTES_ONLY) {
+            Serial.printf("[CMD->LED] tx=%u/%u bytes\n", static_cast<unsigned>(written), static_cast<unsigned>(frameLen));
+        }
+    } else if (Serial && !PRINT_NOTES_ONLY) {
+        Serial.println("[CMD->LED] encode failed");
     }
 
     if (Serial && !PRINT_NOTES_ONLY) {
@@ -963,17 +923,11 @@ void setup() {
         activeChannelLabel = "LEFT (ch0) [DEFAULT]";
     }
 
-    if (Serial && !PRINT_NOTES_ONLY) {
-        Serial.println("\n=== Teensy FFT Bridge ===");
-        Serial.print("Serial#: ");
-        Serial.println(usb_string_serial_number);
-        Serial.print("SPDIF Channel: ");
-        Serial.println(activeChannelLabel);
-        Serial.print("Firmware: teensy_fft | Built: ");
+    if (Serial) {
+        Serial.print("FFT ");
+        Serial.print(activeChannelLabel);
+        Serial.print(" | ");
         Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
-        Serial.println("Beat detection: DISABLED (vocal envelope only)");
-        Serial.println("Pitch detection: LOCAL (chroma + dominant pitch)");
-        Serial.println("========================================\n");
     }
 
     // Initialize chord detection lookup table
@@ -994,7 +948,6 @@ void setup() {
     Serial2.begin(LED_BAUD_RATE);
     delay(100);
 
-    cpuIntervalStartMicros = micros();
 }
 
 // ============================================================================
@@ -1002,7 +955,6 @@ void setup() {
 // ============================================================================
 void loop() {
     unsigned long now = millis();
-    uint32_t loopStartMicros = micros();
 
     updateSpdifSampleRate();
 
@@ -1018,74 +970,26 @@ void loop() {
         sendFftFrame();
     }
 
-    // Status output every 5 seconds
-    if (Serial && !PRINT_NOTES_ONLY && now - lastStatusTime >= STATUS_INTERVAL_MS) {
+    // Status output every 10 seconds
+    if (Serial && now - lastStatusTime >= STATUS_INTERVAL_MS) {
         lastStatusTime = now;
-        uint32_t intervalMicros = micros() - cpuIntervalStartMicros;
-        float avgCpuPct = 0.0f;
-        float peakCpuPct = 0.0f;
-        if (intervalMicros > 0 && cpuLoopCount > 0) {
-            float avgLoopPeriod = static_cast<float>(intervalMicros) / static_cast<float>(cpuLoopCount);
-            avgCpuPct = (static_cast<float>(cpuBusySumMicros) / static_cast<float>(intervalMicros)) * 100.0f;
-            peakCpuPct = (static_cast<float>(cpuLoopMaxMicros) / avgLoopPeriod) * 100.0f;
-        }
-        Serial.print("FFT SPDIF:");
+        Serial.print("SPDIF:");
         Serial.print(spdifInput.pllLocked() ? "LOCK" : "NOLOCK");
         Serial.print(" SR:");
         Serial.print(spdifSampleRate);
-        // HPS pitch info
-        Serial.print(" Note:");
-        if (dominantPitch < 12) {
-            Serial.print(pitchNames[dominantPitch]);
-            Serial.print(dominantPitchHz);
-            Serial.print("Hz(");
-            Serial.print(dominantPitchStrength);
-            Serial.print(")");
-        } else {
-            Serial.print("--");
-        }
-        Serial.print(" VocalEnv:");
-        Serial.print(vocalEnvOut);
-        Serial.print(" Syll:");
-        Serial.print(vocalSyllableHit);
-        Serial.print(" SNote:");
-        if (lastSyllableNote < 12) {
-            Serial.print(pitchNames[lastSyllableNote]);
-            Serial.print("(");
-            Serial.print(lastSyllableStrength);
-            Serial.print(")");
-        } else {
-            Serial.print("--");
-        }
-        Serial.print(" Hold:");
-        if (vocalSustain && vocalNoteOut < 12) {
-            Serial.print(pitchNames[vocalNoteOut]);
-            Serial.print("(");
-            Serial.print(vocalNoteStrengthOut);
-            Serial.print(")");
-        } else {
-            Serial.print("--");
-        }
-
         Serial.print(" CPU:");
-        Serial.print(avgCpuPct, 1);
-        Serial.print("%/");
-        Serial.print(peakCpuPct, 1);
+        Serial.print(AudioProcessorUsage(), 1);
         Serial.print("%");
-        Serial.print(" Bands(");
-        Serial.print(BANDS_12);
-        Serial.print("):");
+        Serial.print(" CPUmax:");
+        Serial.print(AudioProcessorUsageMax(), 1);
+        Serial.print("%");
+        Serial.print(" Bands:");
         for (int i = 0; i < BANDS_12; i++) {
             Serial.print(smoothedBandAmplitude[i], 4);
             if (i < BANDS_12 - 1) Serial.print(",");
         }
         Serial.println();
-
-        cpuIntervalStartMicros = micros();
-        cpuBusySumMicros = 0;
-        cpuLoopMaxMicros = 0;
-        cpuLoopCount = 0;
-        fftFrameSeenSinceStatus = false;
+        AudioProcessorUsageMaxReset();
     }
 
     // FFT frame report
@@ -1094,8 +998,4 @@ void loop() {
         lastFftFrameReport = now;
     }
 
-    uint32_t loopMicros = micros() - loopStartMicros;
-    cpuBusySumMicros += loopMicros;
-    if (loopMicros > cpuLoopMaxMicros) cpuLoopMaxMicros = loopMicros;
-    cpuLoopCount++;
 }
