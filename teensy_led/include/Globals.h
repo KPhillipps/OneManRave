@@ -34,9 +34,18 @@
 // ============================================================================
 // LED Configuration
 // ============================================================================
-// Comment/uncomment to switch between left (WS2812B) and right (APA102) sides
-#define USE_WS2812B   // Left side: WS2812B strips
-// #define USE_APA102 // Right side: APA102 strips
+// Board target is selected at compile time via the PlatformIO environment:
+//   pio run -e teensy_led_left  -> -D BOARD_LEFT_WS2812B
+//   pio run -e teensy_led_right -> -D BOARD_RIGHT_APA102
+// The legacy USE_WS2812B / USE_APA102 macros are derived from those flags so
+// existing #ifdefs throughout the codebase keep working unchanged.
+#if defined(BOARD_LEFT_WS2812B)
+  #define USE_WS2812B   // Left side: WS2812B strips via OctoWS2811
+#elif defined(BOARD_RIGHT_APA102)
+  #define USE_APA102    // Right side: APA102 strips via FastLED SPI
+#else
+  #error "No board target defined. Build via -e teensy_led_left or -e teensy_led_right (sets BOARD_LEFT_WS2812B / BOARD_RIGHT_APA102)."
+#endif
 
 #define NUM_STRIPS 6                         // 6 physical strips
 #define LEDS_PER_VIRTUAL_STRIP 144           // LEDs per virtual strip
@@ -68,9 +77,21 @@
 // ============================================================================
 // Pin Configuration
 // ============================================================================
-// Data pins for each strip (must match FastLED.addLeds order in main.cpp)
+// Data pins for each strip (must match FastLED.addLeds order in main.cpp).
+// Order matches the chain index used by mapVirtualStrip()/initializeVirtualStripsAPA102Right().
 constexpr int STRIP_PINS[6] = {6, 7, 2, 21, 5, 8};
 constexpr int CLOCK_PIN = 14;  // Shared SPI clock for APA102 strips (right side)
+
+// Right-side carrier board has a 74HCT245 buffer/level-shifter on every data
+// line. Its OE pin is wired to Teensy pin 3 and is active-HIGH. Without
+// driving this pin HIGH at boot, the buffer stays in high-Z and *no* APA102
+// signal reaches the RJ45 connectors. Setup must:
+//     pinMode(BUFFER_ENABLE, OUTPUT);
+//     digitalWrite(BUFFER_ENABLE, HIGH);
+// before the FastLED.addLeds<APA102, ...> calls.
+#ifdef BOARD_RIGHT_APA102
+constexpr int BUFFER_ENABLE = 3;
+#endif
 
 // ============================================================================
 // Global LED Arrays (extern - defined in main.cpp)

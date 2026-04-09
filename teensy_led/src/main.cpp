@@ -753,71 +753,74 @@ void setup() {
     DBG_SERIAL_PRINTLN("=== RaveGPT Teensy B: LED Display (SERIAL FFT MODE) ===");
 
     // ------------------------------------------------------------------
-    // Auto-detect which physical LED Teensy this is based on chip serial.
-    // The PJRC-assigned USB serial number is derived from HW_OCOTP_MAC0,
-    // which we can read directly at runtime as a uint32_t.
+    // Board target is selected at COMPILE time by the PlatformIO env:
+    //   pio run -e teensy_led_left  -> -D BOARD_LEFT_WS2812B
+    //   pio run -e teensy_led_right -> -D BOARD_RIGHT_APA102
     //
-    // Get a board's serial via Mac terminal:
-    //   system_profiler SPUSBDataType | grep -A 10 -i teensy
+    // The wrong-chipset branch isn't even compiled in, so it's impossible
+    // to drive APA102 strips with WS2812B timing (or vice versa) by
+    // accident. Build flag is enforced via #error in Globals.h.
     //
-    // Known boards:
-    //   19169950  -> LEFT  side  (WS2812B)
-    //   <TBD>     -> RIGHT side  (APA102)   [placeholder]
+    // HW_OCOTP_MAC0 is still printed for reference so each board's chip
+    // serial is logged at boot.
     // ------------------------------------------------------------------
-    constexpr uint32_t SERIAL_LEFT_WS2812B  = 19169950;
-    constexpr uint32_t SERIAL_RIGHT_APA102  = 0xFFFFFFFF;  // TODO: fill in
-
-    const uint32_t boardSerial = HW_OCOTP_MAC0;
-    // FORCED: only WS2812B left board exists right now. HW_OCOTP_MAC0 does not
-    // equal the PJRC-derived USB serial (19169950), so the auto-detect was
-    // falling through to the APA102 branch and driving WS2812B strips with SPI
-    // = garbage noise even on solid-white fills. Hardcode until the right
-    // board is wired and we know both MAC0 values.
-    const bool isLeftWS2812B   = true;
-    const bool isRightAPA102   = false;
-    (void)SERIAL_LEFT_WS2812B;
-    (void)SERIAL_RIGHT_APA102;
-
     Serial.print("Board MAC0 (raw HW_OCOTP_MAC0): ");
-    Serial.println(boardSerial);
-    Serial.println("Forced branch: LEFT (WS2812B)");
+    Serial.println(HW_OCOTP_MAC0);
+#if defined(BOARD_LEFT_WS2812B)
+    Serial.println("Build target: LEFT panel (WS2812B / OctoWS2811)");
+#elif defined(BOARD_RIGHT_APA102)
+    Serial.println("Build target: RIGHT panel (APA102 / FastLED + pin14 clock)");
+#endif
 
     DBG_SERIAL_PRINT("Compiled: ");
     DBG_SERIAL_PRINTLN(__FILE__);
     DBG_SERIAL_PRINTLN("Reading FFT data from Serial1 (RX1/pin 0)");
     DBG_SERIAL_PRINTLN("Starting in Off mode; waiting for commands\n");
 
-    // Initialize LED strips - branch on detected board.
-    if (isLeftWS2812B) {
-        // Left side: WS2812B driven via FastLED's OCTOWS2811 controller.
-        // OctoWS2811 uses DMA + hardware timers for parallel output across
-        // 8 fixed channels (pins 2,14,7,8,6,20,21,5). This is immune to the
-        // Serial1 RX ISR jitter that breaks FastLED's bit-banged WS2812B
-        // driver at 460800 baud. The leds[] buffer must hold all 8 channels
-        // (LED_BUFFER_SIZE = 2304); ch5 (pin 20) and ch7 (pin 5) are not
-        // wired on this board but their buffer slots still need to exist.
-        FastLED.addLeds<OCTOWS2811>(leds, LEDS_PER_PHYSICAL_STRIP);
-    } else {
-        // Right side: APA102 (SPI with shared clock, BGR order). Default
-        // for unknown boards too — APA102 is the original wiring.
-        FastLED.addLeds<APA102, 6,  CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds, 288);
-        FastLED.addLeds<APA102, 7,  CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds + 288, 288);
-        FastLED.addLeds<APA102, 2,  CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds + 576, 288);
-        FastLED.addLeds<APA102, 21, CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds + 864, 288);
-        FastLED.addLeds<APA102, 5,  CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds + 1152, 288);
-        FastLED.addLeds<APA102, 8,  CLOCK_PIN, BGR, DATA_RATE_MHZ(10)>(leds + 1440, 288);
-    }
+    // ------------------------------------------------------------------
+    // LED hardware init - compile-time branch on board target.
+    // ------------------------------------------------------------------
+#if defined(BOARD_LEFT_WS2812B)
+    // Left side: WS2812B driven via FastLED's OCTOWS2811 controller.
+    // OctoWS2811 uses DMA + hardware timers for parallel output across
+    // 8 fixed channels (pins 2,14,7,8,6,20,21,5). This is immune to the
+    // Serial1 RX ISR jitter that breaks FastLED's bit-banged WS2812B
+    // driver at 460800 baud. The leds[] buffer must hold all 8 channels
+    // (LED_BUFFER_SIZE = 2304); ch5 (pin 20) and ch7 (pin 5) are not
+    // wired on this board but their buffer slots still need to exist.
+    FastLED.addLeds<OCTOWS2811>(leds, LEDS_PER_PHYSICAL_STRIP);
+#elif defined(BOARD_RIGHT_APA102)
+    // Right side: APA102 (4-wire SPI, BGR order, 12 MHz). Six data pins
+    // share CLOCK_PIN=14. The carrier board has a 74HCT245 buffer/level
+    // shifter on every data line; its OE pin (Teensy pin 3 = BUFFER_ENABLE,
+    // active-HIGH) MUST be driven HIGH at boot or the buffer sits in
+    // high-Z and the RJ45 cables see no APA102 signal at all. This is the
+    // single most common reason "right side stays dark."
+    pinMode(BUFFER_ENABLE, OUTPUT);
+    digitalWrite(BUFFER_ENABLE, HIGH);
 
-    // Power limiting
+    // Chain order MUST match initializeVirtualStripsAPA102Right(): chain 0
+    // = pin 6 (rightmost physical pair), chain 5 = pin 8 (leftmost pair).
+    // setCorrection(TypicalLEDStrip) restores the warm tint the original
+    // build used; drop it if you want raw RGB.
+    FastLED.addLeds<APA102, 6,  CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds,        288).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<APA102, 7,  CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds + 288,  288).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<APA102, 2,  CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds + 576,  288).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<APA102, 21, CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds + 864,  288).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<APA102, 5,  CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds + 1152, 288).setCorrection(TypicalLEDStrip);
+    FastLED.addLeds<APA102, 8,  CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(leds + 1440, 288).setCorrection(TypicalLEDStrip);
+#endif
+
+    // Power limiting (kMaxLedPowerMilliWatts is per-side in Globals.h)
     FastLED.setMaxPowerInMilliWatts(kMaxLedPowerMilliWatts);
     FastLED.setBrightness(mapBrightnessInputToRaw(10));
     FastLED.clear(true);
 
-    if (isLeftWS2812B) {
-        initializeVirtualStripsWS2812BLeft();
-    } else {
-        initializeVirtualStripsAPA102Right();
-    }
+#if defined(BOARD_LEFT_WS2812B)
+    initializeVirtualStripsWS2812BLeft();
+#elif defined(BOARD_RIGHT_APA102)
+    initializeVirtualStripsAPA102Right();
+#endif
 
     DBG_SERIAL_PRINTLN("FastLED initialized.");
 
