@@ -24,12 +24,14 @@ extern "C" char usb_string_serial_number[];
 // This is a SLAVE device - NO LOCAL UI OR KEYBOARD INPUT.
 // USB Serial is for debug output ONLY.
 //
-// ========================== SERIAL1 PROTOCOL ==========================
-// Serial1 @ 460800 baud (binary-only):
-// Frame: [0xAA][type][seq][len][payload][crc16][0xBB]
-// - type=0x01: FFT payload (68 bytes): 12 floats + vocal bytes + spdif + chroma[12] + dominantPitch + pitchStrength + reserved
-// - type=0x02: CMD payload (68 bytes): mode, pattern, pattern, brightness, then padding
-// - type=0x03: AUX payload (36 bytes): bandVis/bandDelta + peak + flux + derived metrics
+// ========================== RX PROTOCOLS ==========================
+// Serial1 (pin 0)  — CMD only, ASCII CSV from the ESP32 @ 460800 baud
+//   Format: "mode,val1,val2,val3\r\n" (matches the USB command interface)
+// Serial4 (pin 16) — FFT + AUX from the FFT Teensy @ 460800 baud, framed
+//   Frame: [0xAA][type][seq][len][payload][crc16][0xBB]
+//   - type=0x01: FFT payload (68 bytes): 12 floats + vocal bytes + spdif + chroma[12] + dominantPitch + pitchStrength + reserved
+//   - type=0x02: CMD payload (68 bytes): mode, pattern, pattern, brightness, then padding (legacy / right-side path)
+//   - type=0x03: AUX payload (36 bytes): bandVis/bandDelta + peak + flux + derived metrics
 //
 // ========================== MODES ==========================
 //   '0' = Off (all black)
@@ -46,20 +48,67 @@ CRGB leds[LED_BUFFER_SIZE];
 CRGB* virtualLeds[NUM_VIRTUAL_STRIPS][LEDS_PER_VIRTUAL_STRIP];  // 12 virtual strips, each LED mapped individually
 constexpr int LEDL = NUM_STRIPS * LEDS_PER_PHYSICAL_STRIP;
 #ifdef USE_WS2812B
-static constexpr uint32_t kMaxLedPowerMilliWatts = 258000;  // 6 WS2812B strips × 43W
+// Power budget for FastLED's runtime power scaler. We already cap raw
+// brightness in mapBrightnessInputToRaw() (kMaxRawBrightness = 230 ≈ 90%
+// true ≈ 78A for all-white on the 80A supply), so this budget should be
+// HIGHER than the hard cap allows — otherwise FastLED's calc would scale
+// brightness down further on bright frames and the user would see the
+// 90% setting deliver less than 90%. 400 W = full 80A supply rating;
+// our hard cap keeps us under that, so this acts purely as a sanity net
+// in case something pushes the buffer past expected current.
+static constexpr uint32_t kMaxLedPowerMilliWatts = 400000;
 #else
 static constexpr uint32_t kMaxLedPowerMilliWatts = 300000;  // 6 APA102 strips
 #endif
+// Brightness input scale — the value sent over the wire from the ESP32.
+// 31 steps gives ~4 seconds floor→ceiling when the Apple Remote's
+// brightness +/- button is held (~7 IR repeats/sec) — fine enough to
+// dial in, fast enough not to bore you. 5-bit fits cleanly into a byte.
 static constexpr uint8_t kBrightnessStepMax = 31;
 
+// Hard ceiling on the raw 0..255 value handed to FastLED. Calibrated for
+// the 5V × 80A supply driving 1728 WS2812B LEDs:
+//   1728 × ~60 mA full white = ~104 A unscaled (way over 80 A)
+//   90% true brightness → 230/255 → ~78 A for all-white worst case,
+//   leaving ~2 A safety margin to the supply rating.
+static constexpr uint8_t kMaxRawBrightness = 230;
+
+// Floor on raw output for any step ≥ 1. WS2812B with 8-bit PWM at raw=1
+// or 2 is barely-distinguishable-from-off; 3 is the lowest reliably
+// visible value. Step 1 should always feel clearly on.
+static constexpr uint8_t kMinRawBrightness = 3;
+
+// Map step (0..31) to raw 0..230 along a gamma-2.0 curve. Linear stepping
+// would put 14 of the 31 steps in the 0..50 raw range (visually
+// indistinguishable) and only 1 step every 7 raw values up high (also
+// visually indistinguishable). Gamma curve gives perceptually equal jumps:
+// step 1 vs 2 looks the same magnitude of change as step 30 vs 31.
+//
+// Formula: raw = kMinRawBrightness + (step² / 31²) × (cap − floor)
+// Done in integer math, no FastLED gamma tables, no floating point.
+//   step  0 → raw 0   (LEDs off)
+//   step  1 → raw 3   (just-visible floor)
+//   step  5 → raw 8
+//   step 10 → raw 26
+//   step 16 → raw 63   (~25% perceived)
+//   step 24 → raw 139  (~55% perceived)
+//   step 31 → raw 230  (90% perceived, hard supply cap)
 static constexpr uint8_t mapBrightnessInputToRaw(int brightness) {
-    return (uint8_t)(((brightness < 0 ? 0 : (brightness > (int)kBrightnessStepMax ? (int)kBrightnessStepMax : brightness)) * 255
-        + (kBrightnessStepMax / 2)) / kBrightnessStepMax);
+    if (brightness <= 0) return 0;
+    if (brightness > (int)kBrightnessStepMax) brightness = kBrightnessStepMax;
+    constexpr uint16_t kRange = (uint16_t)kMaxRawBrightness - (uint16_t)kMinRawBrightness;
+    constexpr uint16_t kMaxSq = (uint16_t)kBrightnessStepMax * (uint16_t)kBrightnessStepMax;
+    uint32_t curved = ((uint32_t)brightness * (uint32_t)brightness * (uint32_t)kRange) / (uint32_t)kMaxSq;
+    uint16_t raw = (uint16_t)curved + (uint16_t)kMinRawBrightness;
+    if (raw > kMaxRawBrightness) raw = kMaxRawBrightness;
+    return (uint8_t)raw;
 }
 
 // State (mode/pattern/brightness)
-// Default: Off mode on boot
-State state = {'0', 0, mapBrightnessInputToRaw(10)};
+// Default: Solid white at the lowest visible brightness step (1 = 1%).
+// LEDs come on dim the moment setup() finishes, confirming the hardware
+// path is live; the remote's brightness-up button steps from there.
+State state = {'S', 0, mapBrightnessInputToRaw(1)};
 
 // Stored settings per mode - restored when switching modes
 struct ModeSettings {
@@ -74,10 +123,14 @@ bool firstRun = false;
 bool message = true;
 volatile bool serialDataPending = false;  // Set TRUE when a command is parsed, patterns check this
 
-// Serial port:
-//  - All frames (FFT/AUX/CMD) from FFT Teensy on Serial1 (RX1 = pin 0)
-//    Commands originate from ESP32, forwarded through FFT Teensy
-HardwareSerial& SERIAL_FFT = Serial1;
+// Two dedicated receive ports — one purpose each, no mixed traffic:
+//   Serial1 (pin 0  RX) : CMD only, ASCII CSV from the ESP32 (TX pin GPIO 39)
+//   Serial4 (pin 16 RX): FFT + AUX only, binary frames from the FFT Teensy
+//                         (its Serial2 TX = pin 8). Yes, the README/HARDWARE.md
+//                         claim FFT TX is pin 1 — those docs are stale; the
+//                         actual FFT firmware uses Serial2.
+HardwareSerial& SERIAL_CMD = Serial1;
+HardwareSerial& SERIAL_FFT = Serial4;
 
 // ============================================================================
 // Serial Receive (Framed Protocol with CRC)
@@ -144,6 +197,21 @@ unsigned long lastFrameTime = 0;
 unsigned long frameCount = 0;
 const unsigned long FRAME_PERIOD_MS = 17;  // ~60 FPS
 unsigned long lastPacketTime = 0;
+
+// RX status counters. Ungated on purpose — this status line survives
+// production builds so you can always tell at a glance whether bytes /
+// frames are arriving on either RX pin. Counters sum across BOTH ports
+// (Serial1 CMD path + Serial4 FFT path); the per-frame counters break
+// down by type, so a missing FFT data feed shows as fft=0/aux=0 even
+// when cmd>0. Printed once every 10s from loop(), then reset.
+static uint32_t rxByteCount  = 0;  // raw bytes read off Serial1 + Serial4
+static uint32_t rxFftCount   = 0;  // valid TYPE_FFT frames applied (Serial4)
+static uint32_t rxAuxCount   = 0;  // valid TYPE_AUX frames applied (Serial4)
+static uint32_t rxCmdCount   = 0;  // valid CMD frames applied (Serial1, ASCII or binary)
+static uint32_t rxDropCount  = 0;  // frames dropped (bad length / EOF / CRC)
+static unsigned long lastRxStatusMs = 0;
+static const unsigned long RX_STATUS_PERIOD_MS = 10000;  // 10-second status
+
 unsigned long cpuWindowStartMs = 0;
 unsigned long cpuFrameCount = 0;
 uint64_t cpuWorkAccumUs = 0;
@@ -213,20 +281,45 @@ static void printStatusOnCommand(unsigned long nowMs) {
 }
 
 // ============================================================================
-// Serial Receiver - FFT/AUX/CMD all arrive on Serial1
+// Serial Receiver - parseSerialFrames() is called once per RX port per loop:
+//   parseSerialFrames(SERIAL_CMD=Serial1, ..., allowFFT=false, allowAUX=false, allowCMD=true)
+//   parseSerialFrames(SERIAL_FFT=Serial4, ..., allowFFT=true,  allowAUX=true,  allowCMD=false)
+//
+// Two on-the-wire protocols are accepted, disambiguated by the first byte:
+//   (a) Binary framed  [0xAA][type][seq][len][payload][crc16][0xBB]
+//       Used by the right-side FFT Teensy on Serial4 (FFT/AUX) and was
+//       also used historically on Serial1 when the FFT was forwarding cmds.
+//   (b) ASCII CSV      "mode,val1,val2,val3\r\n"
+//       Used by the left-side ESP32 on Serial1, same text the USB command
+//       interface accepts. 0xAA kicks off binary frame parsing; anything
+//       else is accumulated as ASCII until newline, then handed to the
+//       existing parseUsbCommandLine().
 // ============================================================================
-// Forward declaration (used by applyCommandPayload)
+// Forward declarations
 static void switchToMode(char newMode, int pattern, int brightness);
 static void applyCommandPayload(const uint8_t* payload);
+static void parseUsbCommandLine(const char* line);  // defined later; shared by USB and Serial1 ASCII paths
 
-// Binary framing: [SOF=0xAA][type][seq][len][payload][crc16][EOF=0xBB]
+// Binary framing state
 struct RxState {
     uint8_t buffer[Proto::MAX_FRAME_SIZE];
     size_t  index = 0;
     unsigned long lastByteMs = 0;
 };
 
-static RxState rxFFT;
+static RxState rxFFT;   // Serial4 — FFT + AUX from FFT Teensy
+static RxState rxCmd;   // Serial1 — CMD from ESP32
+
+// ASCII CSV line accumulator. Used by parseSerialFrames() when the input
+// stream is text (ESP32 → Serial1 case). Both parseSerialFrames calls
+// share this buffer, but only Serial1 is expected to deliver ASCII; if
+// Serial4 ever produced printable noise it could interleave. Separate from
+// the USB ASCII path so USB and hardware-UART partial lines can't clobber
+// each other.
+static char     rxAsciiLine[32];
+static size_t   rxAsciiIdx     = 0;
+static int      rxAsciiCommas  = 0;
+static unsigned long rxAsciiLastByteMs = 0;
 
 static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, bool allowAUX, bool allowCMD) {
     auto resyncFromBuffer = [&]() {
@@ -242,12 +335,55 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
         resyncFromBuffer();
     }
 
+    // Idle-flush a stale ASCII line if nothing has arrived for a while (e.g.
+    // sender dropped mid-line). Without this, noise could leave the buffer
+    // permanently half-full.
+    if (rxAsciiIdx > 0 && (millis() - rxAsciiLastByteMs) > 100) {
+        rxAsciiIdx    = 0;
+        rxAsciiCommas = 0;
+    }
+
     while (port.available()) {
         uint8_t b = port.read();
+        rxByteCount++;  // counted regardless of whether it makes it into a valid frame
         st.lastByteMs = millis();
 
         if (st.index == 0) {
-            if (b == Proto::SOF) st.buffer[st.index++] = b;
+            if (b == Proto::SOF) {
+                // Start of a binary frame. Flush any ASCII line in progress
+                // (would be corrupt if a binary frame interrupted it anyway).
+                rxAsciiIdx    = 0;
+                rxAsciiCommas = 0;
+                st.buffer[st.index++] = b;
+                continue;
+            }
+            // Not a binary SOF -> try ASCII CSV path.
+            rxAsciiLastByteMs = millis();
+            if (b == '\n' || b == '\r') {
+                // Line terminator. If we have a plausible CSV (at least 2
+                // commas, matching the "mode,val1,val2,val3" format the
+                // ESP32 sends), parse it. Otherwise discard.
+                if (rxAsciiIdx > 0 && rxAsciiCommas >= 2) {
+                    rxAsciiLine[rxAsciiIdx] = '\0';
+                    // Echo the full raw line so you can see exactly what arrived
+                    // on the wire before it's parsed/validated. The [CMD] line
+                    // that applyCommandPayload emits afterward shows how it was
+                    // interpreted and applied.
+                    Serial.printf("[RX CMD RAW] \"%s\"\n", rxAsciiLine);
+                    parseUsbCommandLine(rxAsciiLine);
+                    rxCmdCount++;  // count Serial1 ASCII commands alongside binary CMD frames
+                }
+                rxAsciiIdx    = 0;
+                rxAsciiCommas = 0;
+            } else if (rxAsciiIdx < sizeof(rxAsciiLine) - 1) {
+                rxAsciiLine[rxAsciiIdx++] = (char)b;
+                if (b == ',') rxAsciiCommas++;
+            } else {
+                // Line too long -> bail, wait for next terminator.
+                rxAsciiIdx    = 0;
+                rxAsciiCommas = 0;
+            }
+            continue;
         } else {
             st.buffer[st.index++] = b;
 
@@ -264,6 +400,7 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
                 }
 
                 if (expectedFrameSize > Proto::MAX_FRAME_SIZE || !lenOk) {
+                    rxDropCount++;
                     DBG_SERIAL_PRINTF("[RX DROP] type=0x%02X len=%u crc=not_checked\n", frameType, payloadLen);
                     resyncFromBuffer();
                     continue;
@@ -275,6 +412,7 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
                     if (st.buffer[expectedFrameSize - 1] != Proto::EOF_BYTE) {
                         uint16_t calcCrc = Proto::crc16_ccitt(&st.buffer[1], 3 + payloadLen);
                         (void)calcCrc;
+                        rxDropCount++;
                         DBG_SERIAL_PRINTF("[RX DROP] len=%u crc=0x%04X\n", payloadLen, calcCrc);
                         resyncFromBuffer();
                         continue;
@@ -284,12 +422,14 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
                     uint16_t calcCrc = Proto::crc16_ccitt(&st.buffer[1], 3 + payloadLen);
                     (void)calcCrc;
                     if (rxCrc != calcCrc) {
+                        rxDropCount++;
                         DBG_SERIAL_PRINTF("[RX DROP] len=%u crc=fail (rx=0x%04X calc=0x%04X)\n", payloadLen, rxCrc, calcCrc);
                         resyncFromBuffer();
                         continue;
                     }
 
                     if (frameType == Proto::TYPE_FFT && allowFFT && payloadLen == Proto::FIXED_PAYLOAD_LEN) {
+                        rxFftCount++;
                         currentBandCount = BANDS_12;
                         memcpy(bandAmplitude, payload, BANDS_12 * sizeof(float));
                         vocalEnv = payload[48];
@@ -304,8 +444,12 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
                         vocalSustain = payload[67];
                         lastPacketTime = millis();
                     } else if (frameType == Proto::TYPE_CMD && allowCMD && payloadLen == Proto::FIXED_PAYLOAD_LEN) {
+                        // applyCommandPayload already prints [CMD] mode=... pattern=... brightness=...
+                        // on every successful command (see its impl). No need for a second print here.
+                        rxCmdCount++;
                         applyCommandPayload(payload);
                     } else if (frameType == Proto::TYPE_AUX && allowAUX && payloadLen == Proto::AUX_PAYLOAD_LEN) {
+                        rxAuxCount++;
                         memcpy(bandVis8, &payload[0], BANDS_12);
                         memcpy(bandDelta8, &payload[12], BANDS_12);
                         globalVis8 = payload[24];
@@ -328,7 +472,8 @@ static void parseSerialFrames(HardwareSerial& port, RxState& st, bool allowFFT, 
 
 // Legacy entry used by patterns
 void processSerialData() {
-    parseSerialFrames(SERIAL_FFT, rxFFT, true, true, true);   // FFT/AUX/CMD from FFT Teensy
+    parseSerialFrames(SERIAL_CMD, rxCmd, false, false, true);  // CMD only from ESP32 (Serial1/pin 0)
+    parseSerialFrames(SERIAL_FFT, rxFFT, true,  true,  false); // FFT+AUX from FFT Teensy (Serial4/pin 16)
 }
 
 // Fire tuning defaults (used by USB F command and fire renderer)
@@ -357,16 +502,27 @@ static void saveFireSettings() {
     EEPROM.put(0, s);
 }
 
-// Apply a TYPE_CMD payload (shared by Serial1 and USB commands)
+// Apply a TYPE_CMD payload (shared by Serial1 and USB commands).
+// payload[3] is the user-facing brightness in 0..kBrightnessStepMax scale
+// (the ESP32 sends in this scale). switchToMode() does the
+// mapBrightnessInputToRaw() conversion internally, so we pass the raw
+// input through unchanged here — mapping in BOTH places double-applies
+// the curve and produces non-linear jumpy brightness steps.
 static void applyCommandPayload(const uint8_t* payload) {
     // Command payload (68 bytes):
-    // 0: mode, 1: pattern, 3: brightness
+    // 0: mode, 1: pattern, 3: brightness (0..kBrightnessStepMax input scale)
     char newMode = payload[0];
     int newPattern = payload[1];
-    int newBrightness = payload[3];
+    int newBrightness = (int)payload[3];
 
     switchToMode(newMode, newPattern, newBrightness);
-    Serial.printf("[CMD] mode=%c pattern=%d brightness=%u\n", state.mode, state.pattern, effectiveBrightnessForCurrentFrame());
+    // Print state.brightness raw (0..255 after mapping) AND the post-power-limit
+    // effective value FastLED is actually showing. If raw>0 but eff=0, the
+    // FastLED power-limit calc is clamping us to zero — usually means the
+    // current leds[] buffer estimates over-budget at this brightness.
+    Serial.printf("[CMD] mode=%c pattern=%d state.brt=%u eff=%u (in=%u)\n",
+                  state.mode, state.pattern, state.brightness,
+                  effectiveBrightnessForCurrentFrame(), (unsigned)payload[3]);
     printStatusOnCommand(millis());
 }
 
@@ -393,19 +549,34 @@ static void parseUsbCommandLine(const char* line) {
 
     char mode = 0;
     int p1 = 0;
+    int p2 = 0;
     int p3 = 0;
 
-    int parsed = sscanf(line, " %c,%d,%d", &mode, &p1, &p3);
-    if (parsed != 3) {
+    int parsed = sscanf(line, " %c,%d,%d,%d", &mode, &p1, &p2, &p3);
+    if (mode >= 'a' && mode <= 'z') {
+        mode = (char)(mode - 'a' + 'A');
+    }
+    if (mode == 'O') {
+        mode = '0';
+    }
+
+    if (parsed < 3 && mode != '0') {
         DBG_SERIAL_PRINTLN("[USB CMD] Parse error");
         return;
     }
+    // Both the USB CSV ("M,pattern,brightness") and the ESP32's 4-field
+    // form ("M,pattern,brightness,val3") put brightness in the 3rd field
+    // (p2). val3 in the 4th field is always 0 in current ESP32 firmware
+    // and isn't used here. Earlier code mistakenly read brightness from p3
+    // when 4 fields were present, which made every command set brt=0.
+    int brightness = p2;
+    (void)p3;  // reserved / unused
 
     if (mode == '0' || mode == 'S' || mode == 'P' || mode == 'M' || mode == 'A') {
         uint8_t payload[Proto::FIXED_PAYLOAD_LEN] = {0};
         payload[0] = static_cast<uint8_t>(mode);
         payload[1] = static_cast<uint8_t>(p1);
-        payload[3] = static_cast<uint8_t>(p3);
+        payload[3] = static_cast<uint8_t>(brightness);
         applyCommandPayload(payload);
     } else {
         DBG_SERIAL_PRINTLN("[USB CMD] Invalid mode");
@@ -464,6 +635,9 @@ static void switchToMode(char newMode, int pattern, int brightness) {
     }
 
     FastLED.setBrightness(state.brightness);
+    if (state.mode == '0') {
+        FastLED.clear(true);
+    }
     serialDataPending = true;
 }
 
@@ -572,6 +746,7 @@ void initializeVirtualStripsAPA102Right() {
     DBG_SERIAL_PRINTLN("Virtual strips initialized: APA102 right (12 strips L->R).");
 }
 
+#if defined(BOARD_LEFT_WS2812B)
 void initializeVirtualStripsWS2812BLeft() {
     // Verified physical L->R layout for the WS2812B (left) installation,
     // driven via FastLED's OCTOWS2811 controller. OctoWS2811 has a FIXED
@@ -605,6 +780,7 @@ void initializeVirtualStripsWS2812BLeft() {
     mapVirtualStrip(11, /*pin14 ch1*/ 1, true  );
     DBG_SERIAL_PRINTLN("Virtual strips initialized: WS2812B left via OctoWS2811 (12 strips L->R).");
 }
+#endif
 
 // Legacy entry point - defaults to the APA102 right layout, since that's the
 // original wiring this project was built for. Boards that need the WS2812B
@@ -664,6 +840,7 @@ void stripTest() {
     unsigned long elapsed = millis() - startTime;
     fill_solid(leds, 1728, CRGB::Black);
     FastLED.show();
+    (void)elapsed;
     DBG_SERIAL_PRINTF("Snake test complete: %lu ms (%d FPS)\n", elapsed, (int)(1728000UL / elapsed));
 }
 
@@ -718,7 +895,8 @@ void handleLEDModes() {
         // Music visualization - same loop pattern as patterns for interruptability
         for (;;) {
             processUsbSerialCommands();
-            parseSerialFrames(SERIAL_FFT, rxFFT, true, true, true);   // FFT/AUX/CMD from FFT Teensy
+            parseSerialFrames(SERIAL_CMD, rxCmd, false, false, true);  // CMD only (Serial1/pin 0)
+            parseSerialFrames(SERIAL_FFT, rxFFT, true,  true,  false); // FFT+AUX only (Serial4/pin 16)
             if (serialDataPending) {
                 break;
             }
@@ -745,7 +923,8 @@ void setup() {
     while (!Serial && (millis() - serialWaitStart) < 1500) {
         delay(10);
     }
-    SERIAL_FFT.begin(BAUD_RATE);  // All frames (FFT/AUX/CMD) from FFT Teensy on Serial1 (RX1/pin 0)
+    SERIAL_CMD.begin(BAUD_RATE);  // CMD from ESP32 on Serial1 RX pin 0
+    SERIAL_FFT.begin(BAUD_RATE);  // FFT/AUX from FFT Teensy on Serial4 RX pin 16
     delay(1000);
 
     loadFireSettings();
@@ -764,18 +943,30 @@ void setup() {
     // HW_OCOTP_MAC0 is still printed for reference so each board's chip
     // serial is logged at boot.
     // ------------------------------------------------------------------
-    Serial.print("Board MAC0 (raw HW_OCOTP_MAC0): ");
-    Serial.println(HW_OCOTP_MAC0);
+    // ------------------------------------------------------------------
+    // Boot banner — UNGATED so it survives production builds. Every MCU
+    // in this project must print firmware name, build time, USB serial,
+    // role, and bus settings so a fresh `pio device monitor` after a
+    // reboot can confirm what's actually running on the chip without
+    // having to flip debug flags.
+    // ------------------------------------------------------------------
+    Serial.println();
+    Serial.println("================================================================");
+    Serial.println("RaveGPT - Teensy B (LED Display Controller)");
+    Serial.printf ("  Firmware     : %s\n", __FILE__);
+    Serial.printf ("  Build        : %s %s\n", __DATE__, __TIME__);
+    Serial.printf ("  USB serial   : %s\n", usb_string_serial_number);
+    Serial.printf ("  HW_OCOTP_MAC0: %lu\n", (unsigned long)HW_OCOTP_MAC0);
 #if defined(BOARD_LEFT_WS2812B)
-    Serial.println("Build target: LEFT panel (WS2812B / OctoWS2811)");
+    Serial.println("  Role         : LEFT panel  (WS2812B / OctoWS2811)");
 #elif defined(BOARD_RIGHT_APA102)
-    Serial.println("Build target: RIGHT panel (APA102 / FastLED + pin14 clock)");
+    Serial.println("  Role         : RIGHT panel (APA102 / FastLED + pin14 clock)");
 #endif
-
-    DBG_SERIAL_PRINT("Compiled: ");
-    DBG_SERIAL_PRINTLN(__FILE__);
-    DBG_SERIAL_PRINTLN("Reading FFT data from Serial1 (RX1/pin 0)");
-    DBG_SERIAL_PRINTLN("Starting in Off mode; waiting for commands\n");
+    Serial.printf ("  CMD bus      : Serial1 RX pin 0   @ %lu baud (ASCII CSV from ESP32)\n", (unsigned long)BAUD_RATE);
+    Serial.printf ("  FFT bus      : Serial4 RX pin 16  @ %lu baud (binary frames from FFT Teensy pin 8)\n", (unsigned long)BAUD_RATE);
+    Serial.printf ("  Boot mode    : '%c' pattern=%d brightness=%u\n", state.mode, state.pattern, state.brightness);
+    Serial.println("================================================================");
+    Serial.println();
 
     // ------------------------------------------------------------------
     // LED hardware init - compile-time branch on board target.
@@ -813,7 +1004,11 @@ void setup() {
 
     // Power limiting (kMaxLedPowerMilliWatts is per-side in Globals.h)
     FastLED.setMaxPowerInMilliWatts(kMaxLedPowerMilliWatts);
-    FastLED.setBrightness(mapBrightnessInputToRaw(10));
+    // Sync FastLED's internal brightness to whatever state.brightness was
+    // initialized to in the global State{} declaration. Without this,
+    // FastLED would default to its own initial value (255) and the first
+    // frame at boot would be max-bright until the first command arrived.
+    FastLED.setBrightness(state.brightness);
     FastLED.clear(true);
 
 #if defined(BOARD_LEFT_WS2812B)
@@ -843,8 +1038,39 @@ void loop() {
     // Read USB serial commands (ASCII CSV)
     processUsbSerialCommands();
 
-    // Read framed data (FFT/AUX/CMD all from FFT Teensy on Serial1)
-    parseSerialFrames(SERIAL_FFT, rxFFT, true, true, true);
+    // Two dedicated receive ports, one purpose each:
+    //   Serial1 (pin 0 RX)  : CMD frames only, direct from ESP32
+    //   Serial4 (pin 16 RX) : FFT + AUX frames only, from FFT Teensy pin 1 TX
+    // Framed [0xAA][type][seq][len][payload][crc16][0xBB] @ 460800 baud. A
+    // [CMD] line is printed to USB serial each time a command frame is applied.
+    parseSerialFrames(SERIAL_CMD, rxCmd, false, false, true);
+    parseSerialFrames(SERIAL_FFT, rxFFT, true,  true,  false);
+
+    // 10-second RX status line. Ungated so it's visible in production builds.
+    // Counts are summed across both receive ports (Serial1 pin 0 for CMD,
+    // Serial4 pin 16 for FFT+AUX). How to read it:
+    //   bytes=0            -> nothing arriving on EITHER pin 0 or pin 16
+    //                         (check wiring / baud / GND on both)
+    //   bytes>0 all 0      -> bytes arriving but never reach a full valid frame
+    //                         (usually baud mismatch or stream not framed)
+    //   bytes>0 drop>0     -> frames close but failing SOF/len/EOF/CRC check
+    //                         (frame format or CRC-poly mismatch)
+    //   fft>0 aux>0        -> FFT Teensy alive (audio live ~600/10s, silent ~10/10s heartbeat)
+    //   cmd>0              -> ESP32 commands applied
+    if (now - lastRxStatusMs >= RX_STATUS_PERIOD_MS) {
+        Serial.printf("[STATUS] RX/10s bytes=%lu fft=%lu aux=%lu cmd=%lu drop=%lu\n",
+                      (unsigned long)rxByteCount,
+                      (unsigned long)rxFftCount,
+                      (unsigned long)rxAuxCount,
+                      (unsigned long)rxCmdCount,
+                      (unsigned long)rxDropCount);
+        rxByteCount = 0;
+        rxFftCount  = 0;
+        rxAuxCount  = 0;
+        rxCmdCount  = 0;
+        rxDropCount = 0;
+        lastRxStatusMs = now;
+    }
 
     // Render at ~60 FPS
     if (now - lastFrameTime >= FRAME_PERIOD_MS) {
